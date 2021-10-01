@@ -586,7 +586,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
-            report_memory_flag = False
+            report_memory_flag = True
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
