@@ -145,20 +145,23 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
             is_oom = True
             break
 
-        m = re.search("iteration[ \t]+(\d+)", output)
+        reg_exp = "iteration[ \t]+(\d+).*?elapsed time per iteration \(ms\):[ \t]+(\d+\.\d*)"
+        reg_exp += ".*?number of skipped iterations: +(\d+)"
+        m = re.search(reg_exp, output)
         if m:
             iteration = int(m[1])
-            if iteration > 1:
-                m = re.search("elapsed time per iteration \(ms\):[ \t]+(\d+\.\d*)?",
-                              output)
-                iter_time_ms = float(m[1])
+            iter_time_ms = float(m[2])
+            skipped_iter = int(m[3])
+            if iteration <= 1 or skipped_iter > 0:
+                iter_time_ms = 0
+        else:
+            m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
+            if m:
+                mem_alloc = float(m[1])
+                mem_allocs.append(mem_alloc)
 
-        m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
-        if m:
-            mem_alloc = float(m[1])
-            mem_allocs.append(mem_alloc)
-            if iter_time_ms and len(mem_allocs) > 1:
-                break
+        if iter_time_ms > 0 and len(mem_allocs) > 1:
+            break
 
     for proc in subprocs:
         try:
