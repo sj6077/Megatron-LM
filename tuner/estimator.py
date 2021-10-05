@@ -2,6 +2,7 @@
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+import logging
 import math
 import os
 import sys
@@ -32,6 +33,8 @@ from megatron.model import Float16Module
 from megatron.model.language_model import Embedding
 
 from tuner.comm_helper import CommType, CommHelper
+
+tuner_logger = logging.getLogger('tuner')
 
 @dataclass
 class Models:
@@ -480,15 +483,13 @@ class Estimator:
         DistributedWrapperContext.patch_dist_func(self.world_size)
         self.curr_mp = self.num_gpus_per_node
         if self.model_name == 'gpt':
-            # initialize model with mp=num_gpus_per_node, dp=1, pp =1
-            os.environ['WORLD_SIZE'] = str(self.num_gpus_per_node)
-            sys.argv += ['--tensor-model-parallel-size', str(self.num_gpus_per_node)]
+            # initialize model with mp=world_size, dp=1, pp =1
+            sys.argv += ['--tensor-model-parallel-size', str(self.world_size)]
             self.models, self.optimizers = get_single_layer_model(
                     gpt_model_provider,
                     args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
             self.train_ds = get_train_dataset(dataset='gpt')
             self.forward_step_func = gpt_forward_step
-            os.environ['WORLD_SIZE'] = str(self.world_size)
         else:
             raise NotImplementedError
         return self
@@ -788,13 +789,19 @@ class Estimator:
 
         self._set_curr_task_to_rank(config)
 
-        forward_times, backward_times = self._get_compute_times()
-        optimizer_times = self._get_optimizer_times()
-        mp_comm_times = self._get_mp_comm_times()
+        try:
+            forward_times, backward_times = self._get_compute_times()
+            optimizer_times = self._get_optimizer_times()
+            mp_comm_times = self._get_mp_comm_times()
 
-        iter_time = get_iter_time_estimation(
-                forward_times, backward_times, optimizer_times,
-                mp_comm_times)
+            iter_time = get_iter_time_estimation(
+                    forward_times, backward_times, optimizer_times,
+                    mp_comm_times)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                tuner_logger.info(f"OOM for {config}")
+                return 0
+            raise e
         return iter_time
 
     def get_max_gpu_memory(self, config):
@@ -809,9 +816,15 @@ class Estimator:
 
         self._set_curr_task_to_rank(config)
 
-        param_sizes, grad_sizes = self._get_param_and_grad_sizes()
-        activation_sizes = self._get_activation_size()
-        peak_memories = self._get_peak_memories()
+        try:
+            param_sizes, grad_sizes = self._get_param_and_grad_sizes()
+            activation_sizes = self._get_activation_size()
+            peak_memories = self._get_peak_memories()
 
-        req_gpu_memory = get_required_gpu_memory(param_sizes, grad_sizes, activation_sizes, peak_memories)
+            req_gpu_memory = get_required_gpu_memory(param_sizes, grad_sizes, activation_sizes, peak_memories)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                tuner_logger.info(f"OOM for {config}")
+                return 0
+            raise e
         return req_gpu_memory

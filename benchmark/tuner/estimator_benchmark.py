@@ -64,6 +64,22 @@ def get_345m_model(fp16, num_layers=4):
                                 seq_length=1024,
                                 fp16=fp16)
 
+def get_7b_model(fp16, num_layers):
+    # 7.5b model
+    return get_model_config_str(num_layers=num_layers,
+                                hidden_size=4096,
+                                num_attention_heads=32,
+                                seq_length=2048,
+                                fp16=fp16)
+
+def get_39b_model(fp16, num_layers):
+    # 39b model
+    return get_model_config_str(num_layers=num_layers,
+                                hidden_size=8192,
+                                num_attention_heads=64,
+                                seq_length=2048,
+                                fp16=fp16)
+
 def get_env_str():
     use_master_env = os.environ['USE_MASTER_ENV']
 
@@ -112,16 +128,23 @@ def get_actual_iter_time_and_memory(model_config_str, dist_config_str, distribut
         subproc = subprocess.Popen([full_cmd],
                                    shell=True,
                                    stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT,
                                    preexec_fn=os.setsid,
                                    bufsize=0)
         subprocs.append(subproc)
 
     mem_allocs = []
     iter_time_ms = 0
+    is_oom = False
     while subprocs[0].poll() is None:
         output = subprocs[0].stdout.readline()
         output = output.strip().decode('utf-8')
         print(output)
+
+        if "CUDA out of memory" in output:
+            is_oom = True
+            break
+
         m = re.search("iteration[ \t]+(\d+)", output)
         if m:
             iteration = int(m[1])
@@ -129,20 +152,22 @@ def get_actual_iter_time_and_memory(model_config_str, dist_config_str, distribut
                 m = re.search("elapsed time per iteration \(ms\):[ \t]+(\d+\.\d*)?",
                               output)
                 iter_time_ms = float(m[1])
-                if len(mem_allocs) > 1:
-                    break
 
         m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
         if m:
             mem_alloc = float(m[1])
             mem_allocs.append(mem_alloc)
-    
+            if iter_time_ms and len(mem_allocs) > 1:
+                break
+
     for proc in subprocs:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except ProcessLookupError:
             pass
 
+    if is_oom:
+        return 0, 0
     return iter_time_ms, mem_allocs[-1] if mem_allocs else 0
 
 def run_comm_helper(world_size):
@@ -176,14 +201,24 @@ def estimator_run(model, world_size, configs_to_test, env, queue):
     mock_argv = get_mock_argv_and_set_master_env(model, world_size)
     run_comm_helper(world_size)
     setattr(sys, 'argv', mock_argv)
-    with Estimator(world_size, min(num_gpus_per_node, world_size)) as estimator:
-        for config in configs_to_test:
-            assert config.mp * config.dp * config.pp == world_size
+    try:
+        with Estimator(world_size, min(num_gpus_per_node, world_size)) as estimator:
+            for config in configs_to_test:
+                assert config.mp * config.dp * config.pp == world_size
 
-            estimated_iter_time = estimator.get_iter_time(config)
-            estimated_gpu_memory = estimator.get_max_gpu_memory(config)
+                estimated_iter_time = estimator.get_iter_time(config)
+                if estimated_iter_time == 0: # OOM
+                    estimated_gpu_memory = 0
+                else:
+                    estimated_gpu_memory = estimator.get_max_gpu_memory(config)
 
-            queue.put((estimated_iter_time, estimated_gpu_memory))
+                queue.put((estimated_iter_time, estimated_gpu_memory))
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            for _ in configs_to_test:
+                queue.put((0, 0))
+        else:
+            raise e
 
 def get_estimated_iter_time_and_memory(model, world_size, configs_to_test):
     ctx = multiprocessing.get_context('spawn')
@@ -229,6 +264,12 @@ def run_estimator_benchmark(model, configs_to_test):
 
         print(config)
 
+        if actual_iter_time == actual_gpu_memory == 0:
+            print("OOM in actual execution:",
+                  f"estimated-iter-time(ms)-{estimated_iter_time}",
+                  f"esitmated-gpu-memory(MB)-{estimated_gpu_memory}")
+            continue
+
         print(f"iter time(ms) :",
               f"actual-{actual_iter_time},", 
               f"estimation-{estimated_iter_time}",
@@ -243,7 +284,7 @@ def run_estimator_benchmark(model, configs_to_test):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Estimator benchmark argument')
-    parser.add_argument('--model', type=str, choices=['small'])
+    parser.add_argument('--model', type=str, choices=['small', 'medium', 'large'])
     parser.add_argument('--benchmark-type', type=str,
                         choices=['single-gpu', 'vmp-single-machine'])
     parser.add_argument('--num-layers', type=int, default=8)
@@ -263,6 +304,10 @@ if __name__ == "__main__":
 
     if args.model == 'small':
         model = get_345m_model(fp16=args.fp16, num_layers=args.num_layers)
+    elif args.model == 'medium':
+        model = get_7b_model(fp16=args.fp16, num_layers=args.num_layers)
+    elif args.model == 'large':
+        model = get_39b_model(fp16=args.fp16, num_layers=args.num_layers)
     else:
         raise NotImplementedError
 
