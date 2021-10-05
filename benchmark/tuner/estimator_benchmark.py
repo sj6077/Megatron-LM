@@ -154,13 +154,13 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
             skipped_iter = int(m[3])
             if iteration <= 1 or skipped_iter > 0:
                 iter_time_ms = 0
-        else:
+        elif iter_time_ms > 0:
             m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
             if m:
                 mem_alloc = float(m[1])
                 mem_allocs.append(mem_alloc)
 
-        if iter_time_ms > 0 and len(mem_allocs) > 1:
+        if iter_time_ms > 0 and len(mem_allocs) > 2:
             break
 
     for proc in subprocs:
