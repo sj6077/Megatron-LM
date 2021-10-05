@@ -13,8 +13,7 @@ from tuner.estimator import Config, Estimator
 
 logging.basicConfig(level=logging.DEBUG)
 
-def get_data_config_str():
-    data_dir = os.environ.get('DATA_DIR', '/cmsdata/ssd1/cmslab/gpt2_data')
+def get_data_config_str(data_dir):
     config_str = f"--data-path {data_dir}/my-gpt2_text_document "\
                  f"--vocab-file {data_dir}/gpt2-vocab.json "\
                  f"--merge-file {data_dir}/gpt2-merges.txt"
@@ -93,11 +92,11 @@ def get_env_str():
             env_str += f'source {venv_path}/bin/activate;'
     return env_str
 
-def get_mock_argv_and_set_master_env(model_config_str, world_size):
+def get_mock_argv_and_set_master_env(data_dir, model_config_str, world_size):
     mock_argv = ['test'] + ['--micro-batch-size', '1', '--global-batch-size', '1']
     mock_argv += ['--tensor-model-parallel-size', str(world_size)]
     mock_argv += model_config_str.split(' ')
-    mock_argv += get_data_config_str().split(' ')
+    mock_argv += get_data_config_str(data_dir).split(' ')
 
     host_list = os.environ.get('HOST_LIST', 'localhost').split(',')
     num_gpus_per_node = int(os.environ.get('NUM_GPUS_PER_NODE', '1'))
@@ -108,13 +107,14 @@ def get_mock_argv_and_set_master_env(model_config_str, world_size):
     os.environ['WORLD_SIZE'] = str(world_size)
     return mock_argv
 
-def get_actual_iter_time_and_memory(model_config_str, dist_config_str, distributed_args, global_batch_size, micro_batch_size):
+def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
+                                    distributed_args, global_batch_size, micro_batch_size):
     host_list = os.environ.get('HOST_LIST', 'localhost').split(',')
     subprocs = []
 
     env_str = get_env_str()
     ssh_user = os.environ.get('SSH_USER', os.environ['USER'])
-    data_config_str = get_data_config_str()
+    data_config_str = get_data_config_str(data_dir)
     for i, host in enumerate(host_list):
         distributed_args += f" --node_rank {i}"
         full_cmd = f"ssh {ssh_user}@{host} "\
@@ -195,10 +195,10 @@ def run_comm_helper(world_size):
                 break
     return subprocs
 
-def estimator_run(model, world_size, configs_to_test, env, queue):
+def estimator_run(data_dir, model, world_size, configs_to_test, env, queue):
     os.environ = env
     num_gpus_per_node = int(os.environ['NUM_GPUS_PER_NODE'])
-    mock_argv = get_mock_argv_and_set_master_env(model, world_size)
+    mock_argv = get_mock_argv_and_set_master_env(data_dir, model, world_size)
     run_comm_helper(world_size)
     setattr(sys, 'argv', mock_argv)
     try:
@@ -220,13 +220,13 @@ def estimator_run(model, world_size, configs_to_test, env, queue):
         else:
             raise e
 
-def get_estimated_iter_time_and_memory(model, world_size, configs_to_test):
+def get_estimated_iter_time_and_memory(data_dir, model, world_size, configs_to_test):
     ctx = multiprocessing.get_context('spawn')
     queue = ctx.Queue()
     child_env = os.environ.copy()
     proc = ctx.Process(
             target=estimator_run,
-            args=(model, world_size, configs_to_test, child_env, queue,))
+            args=(data_dir, model, world_size, configs_to_test, child_env, queue,))
     proc.start()
     result = {}
     for config in configs_to_test:
@@ -234,7 +234,7 @@ def get_estimated_iter_time_and_memory(model, world_size, configs_to_test):
     proc.join()
     return result
 
-def run_estimator_benchmark(model, configs_to_test):
+def run_estimator_benchmark(data_dir, model, configs_to_test):
     estimation_results = {}
     configs_to_test_per_world_size = defaultdict(list)
     for config in configs_to_test:
@@ -243,7 +243,7 @@ def run_estimator_benchmark(model, configs_to_test):
     
     for world_size, test_configs in configs_to_test_per_world_size.items():
         estimation_results.update(get_estimated_iter_time_and_memory(
-            model, world_size, test_configs))
+            data_dir, model, world_size, test_configs))
 
     actual_results = []
     for config in configs_to_test:
@@ -251,6 +251,7 @@ def run_estimator_benchmark(model, configs_to_test):
                 mp=config.mp, pp=config.pp, dp=config.dp)
         actual_iter_time, actual_gpu_memory = \
                 get_actual_iter_time_and_memory(
+                        data_dir,
                         model,
                         dist_config_str,
                         distributed_args,
@@ -288,6 +289,7 @@ if __name__ == "__main__":
     parser.add_argument('--benchmark-type', type=str,
                         choices=['single-gpu', 'vmp-single-machine'])
     parser.add_argument('--num-layers', type=int, default=8)
+    parser.add_argument('--data-dir', type=str, default=None)
     parser.add_argument('--fp16', action='store_true')
     args = parser.parse_args()
 
@@ -327,4 +329,4 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-    run_estimator_benchmark(model, configs_to_test)
+    run_estimator_benchmark(args.data_dir, model, configs_to_test)
