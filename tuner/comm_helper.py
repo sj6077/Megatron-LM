@@ -1,8 +1,11 @@
 """Receive commuinication request from estimator and send back the communication time"""
 from enum import IntEnum
+import os
+import time
 from typing import List
 
 import torch
+from torch._C._distributed_c10d import ReduceOp
 
 class CommType(IntEnum):
     END = 0 # represent communication loop ends
@@ -10,10 +13,10 @@ class CommType(IntEnum):
     BROADCAST = 1
     ALLREDUCE = 2
 
-supported_dtypes = [torch.int16, torch.int32, torch.float16, torch.float32]
+supported_dtypes = [torch.int16, torch.int32, torch.int64, torch.float16, torch.float32]
 
 def encode_comm_type(comm_type: CommType):
-    return torch.IntTensor(int(comm_type))
+    return torch.IntTensor([int(comm_type)])
 
 def decode_comm_type(tensor: torch.Tensor):
     comm_type_val = tensor.item()
@@ -37,9 +40,8 @@ def decode_comm_ranks(tensor: torch.Tensor):
     comm_ranks = [val[i+1] for i in range(num_ranks)]
     return comm_ranks
 
-def encode_tensor_dtype_and_shape(tensor: torch.Tensor):
-    dtype_id = supported_dtypes.index(tensor.dtype)
-    tensor_shape = list(tensor.size())
+def encode_tensor_dtype_and_shape(dtype: torch.Tensor.dtype, tensor_shape: List[int]):
+    dtype_id = supported_dtypes.index(dtype)
     assert len(tensor_shape) < 9
     val = [0] * 10
     val[0] = dtype_id
@@ -62,41 +64,51 @@ class CommHelper:
         assert 'MASTER_ADDR' in os.environ
         assert 'MASTER_PORT' in os.environ
 
-        world_size = os.environ['WORLD_SIZE']
-        rank = os.environ['RANK']
-        local_rank = os.environ['LOCAL_RANK']
+        world_size = int(os.environ['WORLD_SIZE'])
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
         torch.cuda.set_device(local_rank)
-
+        
         torch.distributed.init_process_group(
                 backend='gloo',
                 world_size=world_size,
                 rank=rank)
+        self.world_size = world_size
         self.my_rank = rank
 
-        self.comm_type_tensor = torch.IntTensor(0)
+        self.comm_type_tensor = torch.IntTensor([0])
         self.comm_ranks_tensor = torch.IntTensor([0] * (world_size + 1))
         self.tensor_shape_tensor = torch.IntTensor([0] * 10)
 
         self.comm_group = {}
+        self.comm_cache = {}
 
-    def request_comm(self, comm_type, comm_ranks, tensor):
+    def request_comm(self, comm_type, comm_ranks, tensor_dtype, tensor_shape):
         comm_ranks.sort()
+        key = (comm_type, tuple(comm_ranks), tensor_dtype, tuple(tensor_shape))
+        if key in self.comm_cache:
+            return self.comm_cache[key]
 
         assert self.my_rank == 0
 
         encoded_comm_type = encode_comm_type(comm_type)
-        encoded_comm_ranks = encode_comm_ranks(comm_ranks)
-        encoded_tensor_shape = encode_tensor_dtype_and_shape(tensor)
+        encoded_comm_ranks = encode_comm_ranks(self.world_size, comm_ranks)
+        encoded_tensor_shape = encode_tensor_dtype_and_shape(
+                tensor_dtype, tensor_shape)
 
         torch.distributed.broadcast(encoded_comm_type, src=0)
         torch.distributed.broadcast(encoded_comm_ranks, src=0)
         torch.distributed.broadcast(encoded_tensor_shape, src=0)
 
-        self._handle_comm(comm_type, comm_ranks, list(tensor.size()))
+        comm_time = self._handle_comm(
+                comm_type, comm_ranks, tensor_dtype, tensor_shape)
+        self.comm_cache[key] = comm_time
+        return comm_time
 
-    def termintate(self):
+    def terminate(self):
         encoded_comm_type = encode_comm_type(CommType.END)
         torch.distributed.broadcast(encoded_comm_type, src=0)
+        torch.distributed.barrier()
 
     def run_msg_handler(self):
         while True:
@@ -107,9 +119,10 @@ class CommHelper:
             torch.distributed.broadcast(self.comm_ranks_tensor, src=0)
             comm_ranks = decode_comm_ranks(self.comm_ranks_tensor)
             torch.distributed.broadcast(self.tensor_shape_tensor, src=0)
-            dtype, tensor_shape = decode_tensor_dtype_and_shape(self.tensor_shape_tensor)
+            tensor_dtype, tensor_shape = decode_tensor_dtype_and_shape(self.tensor_shape_tensor)
 
-            self._handle_comm(comm_type, comm_ranks, dtype, tensor_shape)
+            self._handle_comm(comm_type, comm_ranks, tensor_dtype, tensor_shape)
+        torch.distributed.barrier()
 
     def _get_comm_group(self, comm_ranks):
         key = tuple(comm_ranks)
@@ -118,18 +131,29 @@ class CommHelper:
             self.comm_group[key] = new_group
         return self.comm_group[key]
 
-    def _handle_comm(self, comm_type, comm_ranks, dtype, tensor_shape):
+    def _handle_comm(self, comm_type, comm_ranks, tensor_dtype, tensor_shape):
         """Execute given communication and send the communication time to rank0"""
+        comm_time_tensor = torch.FloatTensor([0.0])
         group = self._get_comm_group(comm_ranks)
-        comm_tensor = torch.randn(tensor_shape, dtype=dtype).cuda()
+        if tensor_dtype in [torch.int16, torch.int32, torch.int64]:
+            comm_tensor = torch.randint(low=0, high=100, size=tuple(tensor_shape))
+        else:
+            comm_tensor = torch.randn(tensor_shape, dtype=tensor_dtype)
+        comm_tensor = comm_tensor.cuda()
         # execute twice to remove initialization overhead
         for _ in range(2):
             torch.distributed.barrier()
             start = time.time()
             if self.my_rank in comm_ranks:
-                # TODO
-                assert False
-                # do the communication
-            torch.distributed.barrier()
-        end = time.time()
-        pass
+                if comm_type == CommType.BROADCAST:
+                    torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
+                elif comm_type == CommType.ALLREDUCE:
+                    torch.distributed.all_reduce(comm_tensor, group=group)
+                else:
+                    raise NotImplementedError
+            torch.cuda.synchronize()
+            comm_time = time.time() - start
+            comm_time_tensor.data[0] = comm_time
+        torch.distributed.all_reduce(comm_time_tensor, op=ReduceOp.SUM)
+        comm_time = comm_time_tensor.item() / len(comm_ranks)
+        return comm_time
