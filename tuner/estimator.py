@@ -36,7 +36,7 @@ from tuner.comm_helper import CommType, CommHelper
 
 tuner_logger = logging.getLogger('tuner')
 
-NUM_AVERAGE = 4
+NUM_AVERAGE = 100
 
 @dataclass
 class Models:
@@ -161,16 +161,16 @@ def get_train_data_iterator(train_data_iterator):
     return train_data_iterator
 
 def get_forward_step_time(comm_logs, forward_step_func, train_data_iterator,
-                          model, input_tensor, compute_loss = False):
+                          model, input_tensor, compute_loss = False, num_try=NUM_AVERAGE+1):
     assert len(comm_logs) == 0
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
 
-    for i in range(NUM_AVERAGE + 1):
+    for i in range(num_try):
         # keep only the last communication logs
         comm_logs.clear()
-        if i == 1:
+        if i == 1 or num_try == 1:
             torch.cuda.synchronize()
             s = time.time()
 
@@ -181,10 +181,11 @@ def get_forward_step_time(comm_logs, forward_step_func, train_data_iterator,
             output = loss
     torch.cuda.synchronize()
     e = time.time()
-    return output, (e - s) / NUM_AVERAGE
+    return output, (e - s) / max(1, num_try - 1)
 
 def get_backward_step_time(comm_logs, optimizer, input_tensor,
-                           output_tensor, output_tensor_grad):
+                           output_tensor, output_tensor_grad,
+                           num_try=NUM_AVERAGE+1):
     assert len(comm_logs) == 0
     args = get_args()
 
@@ -192,10 +193,10 @@ def get_backward_step_time(comm_logs, optimizer, input_tensor,
     if input_tensor is not None:
         input_tensor.retain_grad()
 
-    for i in range(NUM_AVERAGE + 1):
+    for i in range(num_try):
         # keep only the last communication logs
         comm_logs.clear()
-        if i == 1:
+        if i == 1 or num_try == 1:
             torch.cuda.synchronize()
             s = time.time()
 
@@ -203,7 +204,7 @@ def get_backward_step_time(comm_logs, optimizer, input_tensor,
         if output_tensor_grad is None:
             output_tensor = optimizer.scale_loss(output_tensor)
         torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad,
-                                retain_graph=i < NUM_AVERAGE)
+                                retain_graph=i < num_try - 1)
 
     torch.cuda.synchronize()
     e = time.time()
@@ -212,7 +213,7 @@ def get_backward_step_time(comm_logs, optimizer, input_tensor,
     input_tensor_grad = None
     if input_tensor is not None:
         input_tensor_grad = input_tensor.grad
-    return input_tensor_grad, (e - s) / NUM_AVERAGE
+    return input_tensor_grad, (e - s) / max(num_try - 1, 1)
 
 def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOptimizer):
     assert len(comm_logs) == 0
@@ -254,42 +255,55 @@ def do_forward_backward(comm_logs, forward_step_func, models,
         model = models.model_without_pre_or_post_process[0]
         optimizer = optimizers.optimizer_without_pre_or_post_process
 
-    torch.cuda.reset_max_memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    # do forward
-    output, forward_time = get_forward_step_time(
-            comm_logs,
-            forward_step_func,
-            train_data_iterator,
-            model,
-            input_tensor,
-            compute_loss=post_process)
-    forward_backward_comm_logs = comm_logs.copy()
-    comm_logs.clear()
-
-    activation_shape = output.size()
-    activation_size = output.nelement() * output.element_size()
-
-    # do backward
-    if post_process:
-        output_tensor_grad = None
-    else:
-        output_tensor_grad = torch.randn(list(activation_shape)).cuda()
-        output_tensor_grad.requires_grad = True
-
-    _, backward_time = get_backward_step_time(
-            comm_logs,
-            optimizer,
-            input_tensor,
-            output,
-            output_tensor_grad)
-    for group, logs in comm_logs.items():
-        if group not in forward_backward_comm_logs:
-            forward_backward_comm_logs[group] = logs
+    # do forward and backward to get peak memory
+    for i in range(2):
+        if i == 0:
+            torch.cuda.reset_max_memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            # execute forward and backward to get peak memory usage
+            num_try = 1
         else:
-            forward_backward_comm_logs[group] += logs
-    comm_logs.clear()
-    peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
+            # execute kernel multiple times to get correct kernel time
+            num_try = NUM_AVERAGE + 1
+
+        # do forward
+        output, forward_time = get_forward_step_time(
+                comm_logs,
+                forward_step_func,
+                train_data_iterator,
+                model,
+                input_tensor,
+                compute_loss=post_process,
+                num_try=num_try)
+        forward_backward_comm_logs = comm_logs.copy()
+        comm_logs.clear()
+
+        activation_shape = output.size()
+        activation_size = output.nelement() * output.element_size()
+
+        # do backward
+        if post_process:
+            output_tensor_grad = None
+        else:
+            output_tensor_grad = torch.randn(list(activation_shape)).cuda()
+            output_tensor_grad.requires_grad = True
+
+        _, backward_time = get_backward_step_time(
+                comm_logs,
+                optimizer,
+                input_tensor,
+                output,
+                output_tensor_grad,
+                num_try=num_try)
+        for group, logs in comm_logs.items():
+            if group not in forward_backward_comm_logs:
+                forward_backward_comm_logs[group] = logs
+            else:
+                forward_backward_comm_logs[group] += logs
+        comm_logs.clear()
+
+        if i == 0:
+            peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
 
     return forward_time, backward_time, activation_shape, activation_size, peak_memory, forward_backward_comm_logs
 

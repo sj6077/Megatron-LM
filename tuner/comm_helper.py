@@ -7,7 +7,7 @@ from typing import List
 import torch
 from torch._C._distributed_c10d import ReduceOp
 
-NUM_AVERAGE = 4
+NUM_AVERAGE = 100
 
 supported_dtypes = [torch.int16, torch.int32, torch.int64, torch.float16, torch.float32]
 
