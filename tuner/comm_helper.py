@@ -7,7 +7,7 @@ from typing import List
 import torch
 from torch._C._distributed_c10d import ReduceOp
 
-NUM_AVERAGE = 10
+NUM_AVERAGE = 5
 
 supported_dtypes = [torch.int16, torch.int32, torch.int64, torch.float16, torch.float32]
 
@@ -149,20 +149,21 @@ class CommHelper:
         comm_tensor = comm_tensor.cuda()
 
         torch.distributed.barrier()
+        torch.cuda.synchronize()
+        comm_times = []
         for i in range(NUM_AVERAGE + 1):
-            if i == 1:
-                torch.cuda.synchronize()
-                start = time.time()
-
             if comm_type == CommType.BROADCAST:
                 torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
             elif comm_type == CommType.ALLREDUCE:
                 torch.distributed.all_reduce(comm_tensor, group=group)
             else:
                 raise NotImplementedError
-        
-        torch.cuda.synchronize()
-        comm_time = (time.time() - start) / NUM_AVERAGE
+
+            s = time.time()
+            torch.cuda.synchronize()
+            if i > 0:
+                comm_times.append(time.time() - s)
+        comm_time = sum(comm_times) / len(comm_times)
         comm_time_tensor.data[0] = comm_time
 
         torch.distributed.all_reduce(comm_time_tensor, op=ReduceOp.SUM)
