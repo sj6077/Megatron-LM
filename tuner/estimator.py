@@ -68,6 +68,11 @@ class TimeOrMemory:
     single_layer: float
     post_process: float
 
+    def __init__(self, pre_process, single_layer, post_process):
+        self.pre_process = max(0, pre_process)
+        self.single_layer = max(0, single_layer)
+        self.post_process = max(0, post_process)
+
     def get_total(self, num_layers):
         return self.pre_process + self.single_layer * num_layers + self.post_process
 
@@ -310,6 +315,11 @@ def do_forward_backward(comm_logs, forward_step_func, models,
 def get_iter_time_estimation(forward_times, backward_times, optimizer_times,
                              mp_forward_backward_times, mp_opt_times):
     """Get iter time estimation as milliseconds"""
+    print("forward_times", forward_times)
+    print("backward_times", backward_times)
+    print("optimizer_times", optimizer_times)
+    print("mp_forward_backward_times", mp_forward_backward_times)
+    print("mp_opt_times")
 
     args = get_args()
     assert args.pipeline_model_parallel_size == args.data_parallel_size == 1
@@ -963,6 +973,11 @@ class Estimator:
             param_sizes, grad_sizes = self._get_param_and_grad_sizes()
             activation_sizes = self._get_activation_size()
             peak_memories = self._get_peak_memories()
+
+            print("param_sizes", param_sizes)
+            print("grad_sizes", grad_sizes)
+            print("activation_sizes", activation_sizes)
+            print("peak_memories", peak_memories)
 
             req_gpu_memory = get_required_gpu_memory(param_sizes, grad_sizes, activation_sizes, peak_memories)
         except RuntimeError as e:
