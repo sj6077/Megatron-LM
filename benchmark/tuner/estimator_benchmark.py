@@ -134,8 +134,9 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
         subprocs.append(subproc)
 
     mem_allocs = []
-    iter_time_ms = 0
+    iter_time_ms = []
     is_oom = False
+    skipped_iter = 1
     while subprocs[0].poll() is None:
         output = subprocs[0].stdout.readline()
         output = output.strip().decode('utf-8')
@@ -150,17 +151,17 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
         m = re.search(reg_exp, output)
         if m:
             iteration = int(m[1])
-            iter_time_ms = float(m[2])
+            iter_time = float(m[2])
             skipped_iter = int(m[3])
-            if iteration <= 1 or skipped_iter > 0:
-                iter_time_ms = 0
-        elif iter_time_ms > 0:
+            if iteration > 1 or skipped_iter == 0:
+                iter_time_ms.append(iter_time)
+        elif skipped_iter == 0:
             m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
             if m:
                 mem_alloc = float(m[1])
                 mem_allocs.append(mem_alloc)
 
-        if iter_time_ms > 0 and len(mem_allocs) > 2:
+        if len(iter_time_ms) > 3 and len(mem_allocs) > 3:
             break
 
     for proc in subprocs:
@@ -171,7 +172,7 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
 
     if is_oom:
         return 0, 0
-    return iter_time_ms, mem_allocs[-1] if mem_allocs else 0
+    return iter_time_ms[-1], mem_allocs[-1] if mem_allocs else 0
 
 def run_comm_helper(world_size):
     host_list = os.environ['HOST_LIST'].split(',')
@@ -322,13 +323,9 @@ if __name__ == "__main__":
                            Config(micro_batch_size=4, global_batch_size=12)]
     elif args.benchmark_type == 'vmp-single-machine':
         configs_to_test = [Config(micro_batch_size=1, global_batch_size=2, mp=1),
-                           Config(micro_batch_size=2, global_batch_size=4, mp=1),
                            Config(micro_batch_size=1, global_batch_size=2, mp=2),
-                           Config(micro_batch_size=2, global_batch_size=4, mp=2),
                            Config(micro_batch_size=4, global_batch_size=8, mp=4),
-                           Config(micro_batch_size=8, global_batch_size=16, mp=4),
-                           Config(micro_batch_size=4, global_batch_size=8, mp=8),
-                           Config(micro_batch_size=8, global_batch_size=16, mp=8)]
+                           Config(micro_batch_size=4, global_batch_size=8, mp=8)]
     else:
         raise NotImplementedError
 

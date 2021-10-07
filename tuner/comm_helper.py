@@ -7,13 +7,14 @@ from typing import List
 import torch
 from torch._C._distributed_c10d import ReduceOp
 
-class CommType(IntEnum):
-    END = 0 # represent communication loop ends
-
-    BROADCAST = 1
-    ALLREDUCE = 2
+NUM_AVERAGE = 4
 
 supported_dtypes = [torch.int16, torch.int32, torch.int64, torch.float16, torch.float32]
+
+class CommType(IntEnum):
+    END = 0
+    BROADCAST = 1
+    ALLREDUCE = 2
 
 def encode_comm_type(comm_type: CommType):
     return torch.IntTensor([int(comm_type)])
@@ -134,26 +135,36 @@ class CommHelper:
     def _handle_comm(self, comm_type, comm_ranks, tensor_dtype, tensor_shape):
         """Execute given communication and send the communication time to rank0"""
         comm_time_tensor = torch.FloatTensor([0.0])
+        if self.my_rank not in comm_ranks:
+            torch.distributed.barrier()
+            torch.distributed.all_reduce(comm_time_tensor, op=ReduceOp.SUM)
+            comm_time = comm_time_tensor.item() / len(comm_ranks)
+            return comm_time
+
         group = self._get_comm_group(comm_ranks)
         if tensor_dtype in [torch.int16, torch.int32, torch.int64]:
-            comm_tensor = torch.randint(low=0, high=100, size=tuple(tensor_shape))
+            comm_tensor = torch.randint(low=0, high=100, size=tuple(tensor_shape)).cuda()
         else:
-            comm_tensor = torch.randn(tensor_shape, dtype=tensor_dtype)
+            comm_tensor = torch.randn(tensor_shape, dtype=tensor_dtype).cuda()
         comm_tensor = comm_tensor.cuda()
-        # execute twice to remove initialization overhead
-        for _ in range(2):
-            torch.distributed.barrier()
-            start = time.time()
-            if self.my_rank in comm_ranks:
-                if comm_type == CommType.BROADCAST:
-                    torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
-                elif comm_type == CommType.ALLREDUCE:
-                    torch.distributed.all_reduce(comm_tensor, group=group)
-                else:
-                    raise NotImplementedError
-            torch.cuda.synchronize()
-            comm_time = time.time() - start
-            comm_time_tensor.data[0] = comm_time
+
+        torch.distributed.barrier()
+        for i in range(NUM_AVERAGE + 1):
+            if i == 1:
+                torch.cuda.synchronize()
+                start = time.time()
+
+            if comm_type == CommType.BROADCAST:
+                torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
+            elif comm_type == CommType.ALLREDUCE:
+                torch.distributed.all_reduce(comm_tensor, group=group)
+            else:
+                raise NotImplementedError
+        
+        torch.cuda.synchronize()
+        comm_time = (time.time() - start) / NUM_AVERAGE
+        comm_time_tensor.data[0] = comm_time
+
         torch.distributed.all_reduce(comm_time_tensor, op=ReduceOp.SUM)
         comm_time = comm_time_tensor.item() / len(comm_ranks)
         return comm_time

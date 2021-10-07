@@ -1,7 +1,7 @@
 """Tuning throught for given model and resources"""
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 import os
@@ -36,6 +36,8 @@ from tuner.comm_helper import CommType, CommHelper
 
 tuner_logger = logging.getLogger('tuner')
 
+NUM_AVERAGE = 4
+
 @dataclass
 class Models:
     model_with_pre_process: List[torch.nn.Module]
@@ -66,10 +68,29 @@ class TimeOrMemory:
     single_layer: float
     post_process: float
 
-def dummy_func_with_return(return_value=None):
-    def dummy_func(*args, **kwargs):
-        return return_value
-    return dummy_func
+    def get_total(self, num_layers):
+        return self.pre_process + self.single_layer * num_layers + self.post_process
+
+@dataclass
+class Log:
+    pre_process: list = field(default_factory=list)
+    single_layer: list = field(default_factory=list)
+    post_process: list = field(default_factory=list)
+
+    def set(self, value, is_pre_process, is_post_process):
+        if is_pre_process:
+            self.pre_process = value
+        elif is_post_process:
+            self.post_process = value
+        else:
+            self.single_layer = value
+
+@contextmanager
+def dummy_handler():
+    try:
+        yield
+    finally:
+        pass
 
 def get_single_layer_model(model_provider, args_defaults=None):
     initialize_megatron(args_defaults=args_defaults)
@@ -139,42 +160,50 @@ def get_train_data_iterator(train_data_iterator):
     train_data_iterator = iter(cyclic_iter(train_dataloader))
     return train_data_iterator
 
-@contextmanager
-def dummy_handler():
-    try:
-        yield
-    finally:
-        pass
-
-def get_forward_step_time(forward_step_func, train_data_iterator, model, input_tensor, compute_loss = False):
+def get_forward_step_time(comm_logs, forward_step_func, train_data_iterator,
+                          model, input_tensor, compute_loss = False):
+    assert len(comm_logs) == 0
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
-    torch.cuda.synchronize()
-    s = time.time()
-    output, loss_func = forward_step_func(train_data_iterator, model)
-    if compute_loss:
-        output = loss_func(output)
-        loss, loss_reduced = output
-        output = loss
+
+    for i in range(NUM_AVERAGE + 1):
+        # keep only the last communication logs
+        comm_logs.clear()
+        if i == 1:
+            torch.cuda.synchronize()
+            s = time.time()
+
+        output, loss_func = forward_step_func(train_data_iterator, model)
+        if compute_loss:
+            output = loss_func(output)
+            loss, loss_reduced = output
+            output = loss
     torch.cuda.synchronize()
     e = time.time()
-    return output, e - s
+    return output, (e - s) / NUM_AVERAGE
 
-def get_backward_step_time(optimizer, input_tensor, output_tensor, output_tensor_grad):
+def get_backward_step_time(comm_logs, optimizer, input_tensor,
+                           output_tensor, output_tensor_grad):
+    assert len(comm_logs) == 0
     args = get_args()
 
     # Retain the grad on the input_tensor.
     if input_tensor is not None:
         input_tensor.retain_grad()
 
-    torch.cuda.synchronize()
-    s = time.time()
+    for i in range(NUM_AVERAGE + 1):
+        # keep only the last communication logs
+        comm_logs.clear()
+        if i == 1:
+            torch.cuda.synchronize()
+            s = time.time()
 
-    # Backward pass.
-    if output_tensor_grad is None:
-        output_tensor = optimizer.scale_loss(output_tensor)
-    torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+        # Backward pass.
+        if output_tensor_grad is None:
+            output_tensor = optimizer.scale_loss(output_tensor)
+        torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad,
+                                retain_graph=i < NUM_AVERAGE)
 
     torch.cuda.synchronize()
     e = time.time()
@@ -183,24 +212,33 @@ def get_backward_step_time(optimizer, input_tensor, output_tensor, output_tensor
     input_tensor_grad = None
     if input_tensor is not None:
         input_tensor_grad = input_tensor.grad
-    return input_tensor_grad, e - s
+    return input_tensor_grad, (e - s) / NUM_AVERAGE
 
-def get_optimizer_time(model: torch.nn.Module, optimizer: MegatronOptimizer):
+def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOptimizer):
+    assert len(comm_logs) == 0
+
     for param in model.parameters():
         if param.requires_grad:
             if optimizer.params_have_main_grad:
                 param.main_grad = torch.randn(list(param.size()), dtype=param.dtype).cuda()
             else:
                 param.grad = torch.randn(list(param.size()), dtype=param.dtype).cuda()
-    torch.cuda.synchronize()
-    s = time.time()
-    optimizer.step()
+
+    for i in range(NUM_AVERAGE + 1):
+        comm_logs.clear()
+        if i == 1:
+            torch.cuda.synchronize()
+            s = time.time()
+        optimizer.step()
     torch.cuda.synchronize()
     e = time.time()
-    return e - s
 
-def do_forward_backward(forward_step_func, models, optimizers, train_data_iterator,
-                        pre_process=False, post_process=False, input_tensor_shape=None):
+    return (e - s) / NUM_AVERAGE
+
+def do_forward_backward(comm_logs, forward_step_func, models,
+                        optimizers, train_data_iterator,
+                        pre_process=False, post_process=False,
+                        input_tensor_shape=None):
     if pre_process:
         input_tensor = None
         model = models.model_with_pre_process[0]
@@ -220,11 +258,14 @@ def do_forward_backward(forward_step_func, models, optimizers, train_data_iterat
     torch.cuda.reset_peak_memory_stats()
     # do forward
     output, forward_time = get_forward_step_time(
+            comm_logs,
             forward_step_func,
             train_data_iterator,
             model,
             input_tensor,
             compute_loss=post_process)
+    forward_backward_comm_logs = comm_logs.copy()
+    comm_logs.clear()
 
     activation_shape = output.size()
     activation_size = output.nelement() * output.element_size()
@@ -237,44 +278,45 @@ def do_forward_backward(forward_step_func, models, optimizers, train_data_iterat
         output_tensor_grad.requires_grad = True
 
     _, backward_time = get_backward_step_time(
+            comm_logs,
             optimizer,
             input_tensor,
             output,
             output_tensor_grad)
+    for group, logs in comm_logs.items():
+        if group not in forward_backward_comm_logs:
+            forward_backward_comm_logs[group] = logs
+        else:
+            forward_backward_comm_logs[group] += logs
+    comm_logs.clear()
     peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
 
-    return forward_time, backward_time, activation_shape, activation_size, peak_memory
+    return forward_time, backward_time, activation_shape, activation_size, peak_memory, forward_backward_comm_logs
 
-def get_iter_time_estimation(forward_times, backward_times, optimizer_times, mp_comm_times):
+def get_iter_time_estimation(forward_times, backward_times, optimizer_times,
+                             mp_forward_backward_times, mp_opt_times):
     """Get iter time estimation as milliseconds"""
 
     args = get_args()
     assert args.pipeline_model_parallel_size == args.data_parallel_size == 1
     num_layers = args.num_layers
     num_micro_batches = args.global_batch_size // args.micro_batch_size
-    kernel_forward_time = forward_times.pre_process
-    kernel_forward_time += forward_times.single_layer * num_layers
-    kernel_forward_time += forward_times.post_process
 
-    kernel_backward_time = backward_times.pre_process
-    kernel_backward_time += backward_times.single_layer * num_layers
-    kernel_backward_time += backward_times.post_process
+    kernel_forward_time = forward_times.get_total(num_layers) * 1000
+    kernel_backward_time = backward_times.get_total(num_layers) * 1000
+    optimizer_time = optimizer_times.get_total(num_layers) * 1000
+    mp_forward_backward_time = mp_forward_backward_times.get_total(num_layers) * 1000
+    mp_opt_time = mp_opt_times.get_total(num_layers) * 1000
 
-    optimizer_time = optimizer_times.pre_process
-    optimizer_time += optimizer_times.single_layer * num_layers
-    optimizer_time += optimizer_times.post_process
+    print('kernel forward time', int(kernel_forward_time * num_micro_batches),
+          'kernel_backward_time', int(kernel_backward_time * num_micro_batches),
+          'optimizer_time', int(optimizer_time),
+          'mp_forward_backward_time', int(mp_forward_backward_time * num_micro_batches),
+          'mp_opt_time', int(mp_opt_time))
 
-    mp_comm_time = mp_comm_times.pre_process
-    mp_comm_time += mp_comm_times.single_layer * num_layers
-    mp_comm_time += mp_comm_times.post_process
-
-    print('kernel forward time', int(kernel_forward_time * num_micro_batches * 1000),
-          'kernel_backward_time', int(kernel_backward_time * num_micro_batches * 1000),
-          'optimizer_time', int(optimizer_time * 1000),
-          'mp_comm_time', int(mp_comm_time * num_micro_batches * 1000))
-    mb_time = kernel_forward_time + kernel_backward_time + mp_comm_time
-    iter_time = mb_time * num_micro_batches + optimizer_time
-    return iter_time * 1000
+    mb_time = kernel_forward_time + kernel_backward_time + mp_forward_backward_time
+    iter_time = mb_time * num_micro_batches + optimizer_time + mp_opt_time
+    return iter_time
 
 def tensor_nested_iterator(item):
     if isinstance(item, dict):
@@ -359,14 +401,14 @@ def get_required_gpu_memory(param_sizes, grad_sizes, activation_size, peak_memor
 
     assert args.activations_checkpoint_method == 'uniform'
 
-    param_size = (param_sizes.pre_process + param_sizes.single_layer * num_layers + param_sizes.post_process) / 1024 / 1024
+    param_size = param_sizes.get_total(num_layers) / 1024 / 1024
     peak_memory = max(peak_memories.pre_process, peak_memories.single_layer, peak_memories.post_process) / 1024 / 1024
     checkpoint_size = (activation_size * num_layers // args.activations_checkpoint_num_layers) / 1024 / 1024
     if num_micro_batches > 1 or args.accumulate_allreduce_grads_in_fp32:
-        grad_size = (grad_sizes.pre_process + grad_sizes.single_layer * num_layers + grad_sizes.post_process) / 1024 / 1024
+        grad_size = grad_sizes.get_total(num_layers) / 1024 / 1024
     else:
-        grad_size = max(0, grad_sizes.single_layer - activation_size / args.activations_checkpoint_num_layers)
-        grad_size *= num_layers / 1024 / 1024
+        grad_size = max(0, grad_sizes.single_layer - activation_size / args.activations_checkpoint_num_layers) * num_layers / 1024 / 1024
+        grad_size += (grad_sizes.pre_process + grad_sizes.post_process) / 1024 / 1024
     print("param_size", param_size, "peak_memory", peak_memory, "checkpoint_size", checkpoint_size, "grad_size", grad_size)
     return param_size + peak_memory + checkpoint_size + grad_size
 
@@ -436,14 +478,19 @@ class DistributedWrapperContext:
         DistributedWrapperContext._COMM_CALLED[comm_group].append((
                 CommType.BROADCAST, tensor.dtype, list(tensor.size())))
 
+    def dummy_func_with_return(return_value=None):
+        def dummy_func(*args, **kwargs):
+            return return_value
+        return dummy_func
+
     @staticmethod
     def patch_dist_func(world_size):
-        setattr(dist, 'init_process_group', dummy_func_with_return())
-        setattr(dist, 'is_initialized', dummy_func_with_return(True))
+        setattr(dist, 'init_process_group', DistributedWrapperContext.dummy_func_with_return())
+        setattr(dist, 'is_initialized', DistributedWrapperContext.dummy_func_with_return(True))
         setattr(dist, 'new_group', DistributedWrapperContext.new_group)
         setattr(dist, 'get_world_size', DistributedWrapperContext.get_world_size(world_size))
-        setattr(dist, 'get_rank', dummy_func_with_return(0))
-        setattr(dist, 'barrier', dummy_func_with_return())
+        setattr(dist, 'get_rank', DistributedWrapperContext.dummy_func_with_return(0))
+        setattr(dist, 'barrier', DistributedWrapperContext.dummy_func_with_return())
         setattr(dist, 'all_reduce', DistributedWrapperContext.all_reduce)
         setattr(dist, 'broadcast', DistributedWrapperContext.broadcast)
 
@@ -477,7 +524,10 @@ class Estimator:
         self.comm_helper = CommHelper()
         self.curr_task_to_rank = {}
 
-        self.mp_comm_times = {} # (mp, mb, num_node) -> mp_comm_time
+        self.mp_forward_backward_comm_logs = defaultdict(Log) # (mp, mb) -> mp comm logs for forward and backward
+        self.mp_opt_comm_logs = defaultdict(Log) # mp -> mp comm logs for optimizer
+        self.mp_forward_backward_times = {} # (mp, mb, num_node) -> mp_comm_time for forward and backward
+        self.mp_opt_times = {} # (mp, mb, num_node) -> mp_comm_time for optimizer
 
     def __enter__(self):
         DistributedWrapperContext.patch_dist_func(self.world_size)
@@ -521,31 +571,53 @@ class Estimator:
 
     def _get_optimizer_times(self):
         mp = get_args().tensor_model_parallel_size
-        if mp in self.optimizer_times:
-            return self.optimizer_times[mp]
+        if mp not in self.optimizer_times:
+            self._set_optimizer_time_and_memory()
+        return self.optimizer_times[mp]
 
+    def _set_optimizer_time_and_memory(self):
         models, optimizers = self._get_models_and_optimizers()
 
         model = models.model_with_pre_process[0]
         optimizer = optimizers.optimizer_with_pre_process
-        pre_process_optimizer_time = get_optimizer_time(model, optimizer)
+        pre_process_optimizer_time = get_optimizer_time(
+                DistributedWrapperContext._COMM_CALLED,
+                model, optimizer)
+        pre_process_comm_logs = DistributedWrapperContext._COMM_CALLED.copy()
+        self._set_comm_logs(pre_process_comm_logs, is_compute=False, pre_process=True)
+        DistributedWrapperContext._COMM_CALLED.clear()
 
         model = models.model_with_post_process[0]
         optimizer = optimizers.optimizer_with_post_process
-        post_process_optimizer_time = get_optimizer_time(model, optimizer)
+        post_process_optimizer_time = get_optimizer_time(
+                DistributedWrapperContext._COMM_CALLED,
+                model, optimizer)
+        single_layer_comm_logs = DistributedWrapperContext._COMM_CALLED.copy()
+        self._set_comm_logs(single_layer_comm_logs, is_compute=False)
+        DistributedWrapperContext._COMM_CALLED.clear()
 
         model = models.model_without_pre_or_post_process[0]
         optimizer = optimizers.optimizer_without_pre_or_post_process
-        single_layer_optimizer_time = get_optimizer_time(model, optimizer)
+        single_layer_optimizer_time = get_optimizer_time(
+                DistributedWrapperContext._COMM_CALLED,
+                model, optimizer)
+        post_process_comm_logs = DistributedWrapperContext._COMM_CALLED.copy()
+        self._set_comm_logs(post_process_comm_logs, is_compute=False, post_process=True)
+        DistributedWrapperContext._COMM_CALLED.clear()
 
         post_process_optimizer_time -= single_layer_optimizer_time
         pre_process_optimizer_time -= single_layer_optimizer_time
 
+        args = get_args()
+        mp = args.tensor_model_parallel_size
         optimizer_times = TimeOrMemory(pre_process_optimizer_time,
                                        single_layer_optimizer_time,
                                        max(0, post_process_optimizer_time))  # post_process 
         self.optimizer_times[mp] = optimizer_times
-        return optimizer_times
+
+        param_sizes, grad_sizes = get_param_and_grad_sizes(models, optimizers)
+        self.param_sizes[mp] = param_sizes
+        self.grad_sizes[mp] = grad_sizes
 
     def _set_curr_task_to_rank(self, config):
         assert config.parallelism_order
@@ -603,64 +675,130 @@ class Estimator:
             comm_ranks.extend([node_start_rank + gpu_id for gpu_id in range(gpus_to_assign)])
         return comm_ranks
 
-    def _get_comm_times(self):
+    def _get_comm_times(self, comm_logs, is_mp=False, is_dp=False, is_pp=False):
         """Get communication times for each communication group of a single layer"""
         args = get_args()
         comm_time_per_num_node = defaultdict(CommTime)
 
         DistributedWrapperContext.unpatch_dist_func()
-        comm_called = DistributedWrapperContext._COMM_CALLED
-        for comm_group, comms_to_measure in comm_called.items():
-            is_mp = comm_group in ['tensor_model_parallel_group', 'model_parallel_group']
-            is_dp = comm_group == 'data_parallel_group'
-            is_pp = comm_group == 'pipeline_model_parallel_group'
-            if is_mp:
-                min_num_node = math.ceil(args.tensor_model_parallel_size / self.num_gpus_per_node)
-                max_num_node = min(args.tensor_model_parallel_size,
-                                    math.ceil(self.world_size / self.num_gpus_per_node))
-                parallel_degree = args.tensor_model_parallel_size
-            elif is_dp:
-                min_num_node = math.ceil(args.data_parallel_size / self.num_gpus_per_node)
-                max_num_node = min(args.data_parallel_size,
-                                    math.ceil(self.world_size / self.num_gpus_per_node))
-                parallel_degree = args.data_parallel_size
-            elif is_pp:
-                min_num_node = 1
-                max_num_node = min(2, math.ceil(self.world_size / self.num_gpus_per_node))
-                parallel_degree = min(2, args.pipeline_model_parallel_size)
-            else:
-                raise NotImplementedError(f"{comm_group} is not supported")
+        if is_mp:
+            min_num_node = math.ceil(args.tensor_model_parallel_size / self.num_gpus_per_node)
+            max_num_node = min(args.tensor_model_parallel_size,
+                                math.ceil(self.world_size / self.num_gpus_per_node))
+            parallel_degree = args.tensor_model_parallel_size
+        elif is_dp:
+            min_num_node = math.ceil(args.data_parallel_size / self.num_gpus_per_node)
+            max_num_node = min(args.data_parallel_size,
+                                math.ceil(self.world_size / self.num_gpus_per_node))
+            parallel_degree = args.data_parallel_size
+        elif is_pp:
+            min_num_node = 1
+            max_num_node = min(2, math.ceil(self.world_size / self.num_gpus_per_node))
+            parallel_degree = min(2, args.pipeline_model_parallel_size)
+        else:
+            raise NotImplementedError(f"{comm_group} is not supported")
 
-            for num_node in range(min_num_node, max_num_node + 1):
-                if is_pp and num_node not in [0, 2]:
-                    continue
-                comm_ranks = self._get_comm_ranks(parallel_degree, num_node)
-                for comm_type, tensor_dtype, tensor_shape in comms_to_measure:
-                    single_comm_time = self.comm_helper.request_comm(
-                            comm_type, comm_ranks, tensor_dtype, tensor_shape)
-                    if is_mp:
-                        comm_time_per_num_node[num_node].mp += single_comm_time
-                    elif is_dp:
-                        comm_time_per_num_node[num_node].dp += single_comm_time
-                    elif is_pp:
-                        comm_time_per_num_node[num_node].pp += single_comm_time
-                    else:
-                        raise NotImplementedError
-        DistributedWrapperContext._COMM_CALLED.clear()
+        for num_node in range(min_num_node, max_num_node + 1):
+            if is_pp and num_node not in [0, 2]:
+                continue
+            comm_ranks = self._get_comm_ranks(parallel_degree, num_node)
+            for comm_type, tensor_dtype, tensor_shape in comm_logs:
+                single_comm_time = self.comm_helper.request_comm(
+                        comm_type, comm_ranks, tensor_dtype, tensor_shape)
+                if is_mp:
+                    comm_time_per_num_node[num_node].mp += single_comm_time
+                elif is_dp:
+                    comm_time_per_num_node[num_node].dp += single_comm_time
+                elif is_pp:
+                    comm_time_per_num_node[num_node].pp += single_comm_time
+                else:
+                    raise NotImplementedError
         DistributedWrapperContext.patch_dist_func(self.world_size)
         return comm_time_per_num_node
 
-    def _get_mp_comm_times(self):
+    def _get_mp_forward_backward_times(self):
         args = get_args()
         mp = args.tensor_model_parallel_size
         mb = args.micro_batch_size
         num_node = self._get_num_node(is_mp=True, is_dp=False, is_pp=False)
         key = (mp, mb, num_node)
-        if key not in self.mp_comm_times:
-            self._set_model_stat()
-        return self.mp_comm_times[key]
+        if key in self.mp_forward_backward_times:
+            return self.mp_forward_backward_times[key]
 
-    def _set_model_stat(self):
+        if (mp, mb) not in self.mp_forward_backward_comm_logs:
+            self._set_forward_backward_time_and_memory()
+
+        comm_logs = self.mp_forward_backward_comm_logs[(mp, mb)].pre_process
+        pre_process_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
+
+        comm_logs = self.mp_forward_backward_comm_logs[(mp, mb)].single_layer
+        single_layer_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
+
+        comm_logs = self.mp_forward_backward_comm_logs[(mp, mb)].post_process
+        post_process_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
+
+        for num_node in single_layer_comm_time_per_num_node:
+            pre_process_comm_time = pre_process_comm_time_per_num_node[num_node]
+            single_layer_comm_time = single_layer_comm_time_per_num_node[num_node]
+            post_process_comm_time = post_process_comm_time_per_num_node[num_node]
+
+            self.mp_forward_backward_times[(mp, mb, num_node)] = TimeOrMemory(
+                    max(0, pre_process_comm_time.mp - single_layer_comm_time.mp),
+                    single_layer_comm_time.mp,
+                    max(0, post_process_comm_time.mp - single_layer_comm_time.mp))
+        return self.mp_forward_backward_times[key]
+
+    def _get_mp_opt_times(self):
+        args = get_args()
+        mp = args.tensor_model_parallel_size
+        num_node = self._get_num_node(is_mp=True, is_dp=False, is_pp=False)
+        key = (mp, num_node)
+        if key in self.mp_opt_times:
+            return self.mp_opt_times[key]
+
+        if mp not in self.mp_opt_comm_logs:
+            # execute optimizers are required to get optimizer communication logs
+            self._set_optimizer_time_and_memory()
+
+        comm_logs = self.mp_opt_comm_logs[mp].pre_process
+        pre_process_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
+        
+        comm_logs = self.mp_opt_comm_logs[mp].single_layer
+        single_layer_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
+
+        comm_logs = self.mp_opt_comm_logs[mp].post_process
+        post_process_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
+
+        for num_node in single_layer_comm_time_per_num_node:
+            pre_process_comm_time = pre_process_comm_time_per_num_node[num_node]
+            single_layer_comm_time = single_layer_comm_time_per_num_node[num_node]
+            post_process_comm_time = post_process_comm_time_per_num_node[num_node]
+
+            self.mp_opt_times[(mp, num_node)] = TimeOrMemory(
+                    pre_process_comm_time.mp - single_layer_comm_time.mp,
+                    single_layer_comm_time.mp,
+                    post_process_comm_time.mp - single_layer_comm_time.mp)
+
+        return self.mp_opt_times[key]
+
+    def _set_comm_logs(self, comm_logs, is_compute, pre_process=False, post_process=False):
+        args = get_args()
+        mp = args.tensor_model_parallel_size
+        mb = args.micro_batch_size
+
+        for comm_group, comms_to_measure in comm_logs.items():
+            is_mp = comm_group in ['tensor_model_parallel_group', 'model_parallel_group']
+            is_dp = comm_group == 'data_parallel_group'
+            is_pp = comm_group == 'pipeline_model_parallel_group'
+            if is_mp:
+                if is_compute:
+                    self.mp_forward_backward_comm_logs[(mp, mb)].set(comms_to_measure, pre_process, post_process)
+                else:
+                    self.mp_opt_comm_logs[mp].set(comms_to_measure, pre_process, post_process)
+            else:
+                tuner_logger.info(f"{comm_group} is not suppported for now")
+
+    def _set_forward_backward_time_and_memory(self):
         """Set forward and backward times, activation size, and peak memory. """
         args = get_args()
         mp = args.tensor_model_parallel_size
@@ -679,28 +817,37 @@ class Estimator:
 
         activation_shape = None
         activation_size = None
+
+        # Ignore small data loader/pmp communication
+        comm_logs = DistributedWrapperContext._COMM_CALLED
+        for comm_group, comms_to_measure in comm_logs.items():
+            for _, _, tensor_shape in comms_to_measure:
+                assert tensor_shape == [1]
+        DistributedWrapperContext._COMM_CALLED.clear()
+
         with context_handler():
-            for _ in range(2):
-                pre_process_forward_time, pre_process_backward_time, \
-                        activation_shape, activation_size, pre_process_peak_memory = \
-                    do_forward_backward(self.forward_step_func, models, optimizers,
-                                        train_data_iterator, pre_process=True, post_process=False,
-                                        input_tensor_shape=None)
-                pre_process_comm_time_per_num_node = self._get_comm_times()
+            pre_process_forward_time, pre_process_backward_time, \
+                    activation_shape, _, pre_process_peak_memory, pre_process_comm_logs = \
+                do_forward_backward(DistributedWrapperContext._COMM_CALLED,
+                                    self.forward_step_func, models, optimizers,
+                                    train_data_iterator, pre_process=True)
+            self._set_comm_logs(pre_process_comm_logs, is_compute=True, pre_process=True)
 
-                single_layer_forward_time, single_layer_backward_time, \
-                        activation_shape, activation_size, single_layer_peak_memory = \
-                    do_forward_backward(self.forward_step_func, models, optimizers,
-                                        train_data_iterator, pre_process=False, post_process=False,
-                                        input_tensor_shape=activation_shape)
-                single_layer_comm_time_per_num_node = self._get_comm_times()
+            single_layer_forward_time, single_layer_backward_time, \
+                    activation_shape, activation_size, single_layer_peak_memory, \
+                    single_layer_comm_logs = \
+                do_forward_backward(DistributedWrapperContext._COMM_CALLED,
+                                    self.forward_step_func, models, optimizers,
+                                    train_data_iterator, input_tensor_shape=activation_shape)
+            self._set_comm_logs(single_layer_comm_logs, is_compute=True)
 
-                post_process_forward_time, post_process_backward_time, \
-                        _, _, post_process_peak_memory = \
-                    do_forward_backward(self.forward_step_func, models, optimizers,
-                                        train_data_iterator, pre_process=False, post_process=True,
-                                        input_tensor_shape=activation_shape)
-                post_process_comm_time_per_num_node = self._get_comm_times()
+            post_process_forward_time, post_process_backward_time, \
+                    _, _, post_process_peak_memory, post_process_comm_logs = \
+                do_forward_backward(DistributedWrapperContext._COMM_CALLED,
+                                    self.forward_step_func, models, optimizers,
+                                    train_data_iterator, post_process=True,
+                                    input_tensor_shape=activation_shape)
+            self._set_comm_logs(post_process_comm_logs, is_compute=True, post_process=True)
 
         pre_process_forward_time -= single_layer_forward_time
         post_process_forward_time -= single_layer_forward_time
@@ -719,18 +866,7 @@ class Estimator:
                                                post_process_peak_memory)
 
         self.activation_size[key] = activation_size
-
         args.global_batch_size = global_batch_size
-
-        for num_node in pre_process_comm_time_per_num_node:
-            pre_process_comm_time = pre_process_comm_time_per_num_node[num_node]
-            single_layer_comm_time = single_layer_comm_time_per_num_node[num_node]
-            post_process_comm_time = post_process_comm_time_per_num_node[num_node]
-            
-            self.mp_comm_times[(mp, mb, num_node)] = TimeOrMemory(
-                    pre_process_comm_time.mp - single_layer_comm_time.mp,
-                    single_layer_comm_time.mp,
-                    post_process_comm_time.mp - single_layer_comm_time.mp)
 
     def _get_compute_times(self):
         args = get_args()
@@ -739,22 +875,14 @@ class Estimator:
 
         key = (mp, mb)
         if key not in self.forward_times:
-            self._set_model_stat()
+            self._set_forward_backward_time_and_memory()
         return self.forward_times[key], self.backward_times[key]
 
     def _get_param_and_grad_sizes(self):
         mp = get_args().tensor_model_parallel_size
-        if mp in self.param_sizes:
-            return self.param_sizes[mp], self.grad_sizes[mp]
-
-        # optimizer must be called at least once to get optimizer states
-        self._get_optimizer_times()
-        models, optimizers = self._get_models_and_optimizers()
-
-        param_sizes, grad_sizes = get_param_and_grad_sizes(models, optimizers)
-        self.param_sizes[mp] = param_sizes
-        self.grad_sizes[mp] = grad_sizes
-        return param_sizes, grad_sizes
+        if mp not in self.param_sizes:
+            self._set_optimizer_time_and_memory()
+        return self.param_sizes[mp], self.grad_sizes[mp]
 
     def _get_activation_size(self):
         args = get_args()
@@ -763,7 +891,7 @@ class Estimator:
 
         key = (mp, mb)
         if key not in self.activation_size:
-            self._set_model_stat()
+            self._set_forward_backward_time_and_memory()
         return self.activation_size[key]
 
     def _get_peak_memories(self):
@@ -773,7 +901,7 @@ class Estimator:
 
         key = (mp, mb)
         if key not in self.peak_memories:
-            self._set_model_stat()
+            self._set_forward_backward_time_and_memory()
 
         return self.peak_memories[key]
 
@@ -792,11 +920,12 @@ class Estimator:
         try:
             forward_times, backward_times = self._get_compute_times()
             optimizer_times = self._get_optimizer_times()
-            mp_comm_times = self._get_mp_comm_times()
+            mp_forward_backward_times = self._get_mp_forward_backward_times()
+            mp_opt_times = self._get_mp_opt_times()
 
             iter_time = get_iter_time_estimation(
                     forward_times, backward_times, optimizer_times,
-                    mp_comm_times)
+                    mp_forward_backward_times, mp_opt_times)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
                 tuner_logger.info(f"OOM for {config}")
