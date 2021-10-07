@@ -36,7 +36,7 @@ from tuner.comm_helper import CommType, CommHelper
 
 tuner_logger = logging.getLogger('tuner')
 
-NUM_AVERAGE = 100
+NUM_AVERAGE = 10
 
 @dataclass
 class Models:
