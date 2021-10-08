@@ -243,11 +243,9 @@ def do_forward_backward(comm_logs, forward_step_func, models,
 
     # do forward and backward to get peak memory
     for i in range(NUM_AVERAGE + 1):
-        torch.cuda.reset_max_memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
-        if i == 1:
-            torch_cuda_synchronize()
-            s = time.time()
+        if i == 0:
+            torch.cuda.reset_max_memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
 
         # do forward
         output = get_forward_step_time(
@@ -284,9 +282,12 @@ def do_forward_backward(comm_logs, forward_step_func, models,
                     forward_backward_comm_logs[group] = logs
                 else:
                     forward_backward_comm_logs[group] += logs
-        comm_logs.clear()
 
-        peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
+            torch_cuda_synchronize()
+            peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
+            s = time.time()
+
+        comm_logs.clear()
 
     torch_cuda_synchronize()
     e = time.time()
