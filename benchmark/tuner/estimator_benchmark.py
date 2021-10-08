@@ -153,11 +153,12 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
             iteration = int(m[1])
             iter_time = float(m[2])
             skipped_iter = int(m[3])
-            if iteration > 1 or skipped_iter == 0:
+            if iteration > 1 and skipped_iter == 0:
                 iter_time_ms.append(iter_time)
         elif skipped_iter == 0:
-            m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
+            m = re.search("\[Rank 0\].*?max allocated:[ \t]+(\d+\.\d*)?", output)
             if m:
+                print("correct output", output)
                 mem_alloc = float(m[1])
                 mem_allocs.append(mem_alloc)
 
