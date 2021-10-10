@@ -94,7 +94,6 @@ def dummy_handler():
         pass
 
 def get_single_layer_model(model_provider, args_defaults=None):
-    initialize_megatron(args_defaults=args_defaults)
 
     args = get_args()
     # disable save and load checkpoints
@@ -533,15 +532,16 @@ class Estimator:
         self.mp_forward_backward_times = {} # (mp, mb, num_node) -> mp_comm_time for forward and backward
         self.mp_opt_times = {} # (mp, mb, num_node) -> mp_comm_time for optimizer
 
+        self.curr_mp = None
+        self.models = None
+        self.optimizers = None
+
     def __enter__(self):
         DistributedWrapperContext.patch_dist_func(self.world_size)
-        self.curr_mp = self.num_gpus_per_node
+        #self.curr_mp = self.num_gpus_per_node
         if self.model_name == 'gpt':
-            # initialize model with mp=world_size, dp=1, pp =1
-            sys.argv += ['--tensor-model-parallel-size', str(self.world_size)]
-            self.models, self.optimizers = get_single_layer_model(
-                    gpt_model_provider,
-                    args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+            args_defaults = args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
+            initialize_megatron(args_defaults=args_defaults)
             self.train_ds = get_train_dataset(dataset='gpt')
             self.forward_step_func = gpt_forward_step
         else:
@@ -559,15 +559,13 @@ class Estimator:
         
         # TODO(SJ): handle oom for the large model
         if self.model_name == 'gpt':
-            del self.models
-            del self.optimizers
+            if self.curr_mp:
+                del self.models
+                del self.optimizers
             torch.cuda.empty_cache()
-            os.environ['WORLD_SIZE'] = str(mp)
-            get_args().tensor_model_parallel_size = mp
             self.models, self.optimizers = get_single_layer_model(
                     gpt_model_provider,
                     args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
-            os.environ['WORLD_SIZE'] = self.world_size
             self.curr_mp = mp
             return self.models, self.optimizers
         else:
