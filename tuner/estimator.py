@@ -754,7 +754,8 @@ class Estimator:
         mb = args.micro_batch_size
 
         for comm_group, comms_to_measure in comm_logs.items():
-            is_mp = comm_group in ['tensor_model_parallel_group', 'model_parallel_group']
+            assert comm_group != 'model_parallel_group', (comms_to_measure)
+            is_mp = comm_group == 'tensor_model_parallel_group'
             is_dp = comm_group == 'data_parallel_group'
             is_pp = comm_group == 'pipeline_model_parallel_group'
             if is_mp:
