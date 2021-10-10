@@ -294,12 +294,11 @@ def do_forward_backward(comm_logs, forward_step_func, models,
     return forward_backward_time, activation_shape, activation_size, peak_memory, forward_backward_comm_logs
 
 def get_iter_time_estimation(forward_backward_times, optimizer_times,
-                             mp_forward_backward_times, mp_opt_times):
+                             mp_forward_backward_times):
     """Get iter time estimation as milliseconds"""
     print("forward_backward_times", forward_backward_times)
     print("optimizer_times", optimizer_times)
     print("mp_forward_backward_times", mp_forward_backward_times)
-    print("mp_opt_times")
 
     args = get_args()
     assert args.pipeline_model_parallel_size == args.data_parallel_size == 1
@@ -309,15 +308,13 @@ def get_iter_time_estimation(forward_backward_times, optimizer_times,
     kernel_forward_backward_time = forward_backward_times.get_total(num_layers) * 1000
     optimizer_time = optimizer_times.get_total(num_layers) * 1000
     mp_forward_backward_time = mp_forward_backward_times.get_total(num_layers) * 1000
-    mp_opt_time = mp_opt_times.get_total(num_layers) * 1000
 
     print('kernel forward backward time', int(kernel_forward_backward_time * num_micro_batches),
           'optimizer_time', int(optimizer_time),
-          'mp_forward_backward_time', int(mp_forward_backward_time * num_micro_batches),
-          'mp_opt_time', int(mp_opt_time))
+          'mp_forward_backward_time', int(mp_forward_backward_time * num_micro_batches))
 
     mb_time = kernel_forward_backward_time + mp_forward_backward_time
-    iter_time = mb_time * num_micro_batches + optimizer_time + mp_opt_time
+    iter_time = mb_time * num_micro_batches + optimizer_time
     return iter_time
 
 def tensor_nested_iterator(item):
@@ -528,9 +525,7 @@ class Estimator:
         self.curr_task_to_rank = {}
 
         self.mp_forward_backward_comm_logs = defaultdict(Log) # (mp, mb) -> mp comm logs for forward and backward
-        self.mp_opt_comm_logs = defaultdict(Log) # mp -> mp comm logs for optimizer
         self.mp_forward_backward_times = {} # (mp, mb, num_node) -> mp_comm_time for forward and backward
-        self.mp_opt_times = {} # (mp, mb, num_node) -> mp_comm_time for optimizer
 
         self.curr_mp = None
         self.models = None
@@ -585,8 +580,9 @@ class Estimator:
         pre_process_optimizer_time = get_optimizer_time(
                 DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
-        pre_process_comm_logs = DistributedWrapperContext._COMM_CALLED.copy()
-        self._set_comm_logs(pre_process_comm_logs, is_compute=False, pre_process=True)
+        for comms_to_measure in DistributedWrapperContext._COMM_CALLED.values():
+            for _, _, tensor_shape in comms_to_measure:
+                assert tensor_shape == [1]
         DistributedWrapperContext._COMM_CALLED.clear()
 
         model = models.model_with_post_process[0]
@@ -594,8 +590,9 @@ class Estimator:
         post_process_optimizer_time = get_optimizer_time(
                 DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
-        single_layer_comm_logs = DistributedWrapperContext._COMM_CALLED.copy()
-        self._set_comm_logs(single_layer_comm_logs, is_compute=False)
+        for comms_to_measure in DistributedWrapperContext._COMM_CALLED.values():
+            for _, _, tensor_shape in comms_to_measure:
+                assert tensor_shape == [1]
         DistributedWrapperContext._COMM_CALLED.clear()
 
         model = models.model_without_pre_or_post_process[0]
@@ -603,8 +600,9 @@ class Estimator:
         single_layer_optimizer_time = get_optimizer_time(
                 DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
-        post_process_comm_logs = DistributedWrapperContext._COMM_CALLED.copy()
-        self._set_comm_logs(post_process_comm_logs, is_compute=False, post_process=True)
+        for comms_to_measure in DistributedWrapperContext._COMM_CALLED.values():
+            for _, _, tensor_shape in comms_to_measure:
+                assert tensor_shape == [1]
         DistributedWrapperContext._COMM_CALLED.clear()
 
         post_process_optimizer_time -= single_layer_optimizer_time
@@ -750,40 +748,7 @@ class Estimator:
                     max(0, post_process_comm_time.mp - single_layer_comm_time.mp))
         return self.mp_forward_backward_times[key]
 
-    def _get_mp_opt_times(self):
-        args = get_args()
-        mp = args.tensor_model_parallel_size
-        num_node = self._get_num_node(is_mp=True, is_dp=False, is_pp=False)
-        key = (mp, num_node)
-        if key in self.mp_opt_times:
-            return self.mp_opt_times[key]
-
-        if mp not in self.mp_opt_comm_logs:
-            # execute optimizers are required to get optimizer communication logs
-            self._set_optimizer_time_and_memory()
-
-        comm_logs = self.mp_opt_comm_logs[mp].pre_process
-        pre_process_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
-        
-        comm_logs = self.mp_opt_comm_logs[mp].single_layer
-        single_layer_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
-
-        comm_logs = self.mp_opt_comm_logs[mp].post_process
-        post_process_comm_time_per_num_node = self._get_comm_times(comm_logs, is_mp=True)
-
-        for num_node in single_layer_comm_time_per_num_node:
-            pre_process_comm_time = pre_process_comm_time_per_num_node[num_node]
-            single_layer_comm_time = single_layer_comm_time_per_num_node[num_node]
-            post_process_comm_time = post_process_comm_time_per_num_node[num_node]
-
-            self.mp_opt_times[(mp, num_node)] = TimeOrMemory(
-                    pre_process_comm_time.mp - single_layer_comm_time.mp,
-                    single_layer_comm_time.mp,
-                    post_process_comm_time.mp - single_layer_comm_time.mp)
-
-        return self.mp_opt_times[key]
-
-    def _set_comm_logs(self, comm_logs, is_compute, pre_process=False, post_process=False):
+    def _set_comm_logs(self, comm_logs, pre_process=False, post_process=False):
         args = get_args()
         mp = args.tensor_model_parallel_size
         mb = args.micro_batch_size
@@ -793,10 +758,7 @@ class Estimator:
             is_dp = comm_group == 'data_parallel_group'
             is_pp = comm_group == 'pipeline_model_parallel_group'
             if is_mp:
-                if is_compute:
-                    self.mp_forward_backward_comm_logs[(mp, mb)].set(comms_to_measure, pre_process, post_process)
-                else:
-                    self.mp_opt_comm_logs[mp].set(comms_to_measure, pre_process, post_process)
+                self.mp_forward_backward_comm_logs[(mp, mb)].set(comms_to_measure, pre_process, post_process)
             else:
                 tuner_logger.info(f"{comm_group} is not suppported for now")
 
@@ -833,7 +795,7 @@ class Estimator:
                 do_forward_backward(DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, pre_process=True)
-            self._set_comm_logs(pre_process_comm_logs, is_compute=True, pre_process=True)
+            self._set_comm_logs(pre_process_comm_logs, pre_process=True)
 
             single_layer_forward_backward_time, \
                     activation_shape, activation_size, single_layer_peak_memory, \
@@ -841,7 +803,7 @@ class Estimator:
                 do_forward_backward(DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, input_tensor_shape=activation_shape)
-            self._set_comm_logs(single_layer_comm_logs, is_compute=True)
+            self._set_comm_logs(single_layer_comm_logs)
 
             post_process_forward_backward_time, \
                     _, _, post_process_peak_memory, post_process_comm_logs = \
@@ -849,7 +811,7 @@ class Estimator:
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, post_process=True,
                                     input_tensor_shape=activation_shape)
-            self._set_comm_logs(post_process_comm_logs, is_compute=True, post_process=True)
+            self._set_comm_logs(post_process_comm_logs, post_process=True)
 
         pre_process_forward_backward_time -= single_layer_forward_backward_time
         post_process_forward_backward_time -= single_layer_forward_backward_time
@@ -917,11 +879,10 @@ class Estimator:
             forward_backward_times = self._get_compute_times()
             optimizer_times = self._get_optimizer_times()
             mp_forward_backward_times = self._get_mp_forward_backward_times()
-            mp_opt_times = self._get_mp_opt_times()
 
             iter_time = get_iter_time_estimation(
                     forward_backward_times, optimizer_times,
-                    mp_forward_backward_times, mp_opt_times)
+                    mp_forward_backward_times)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
                 tuner_logger.info(f"OOM for {config}")
