@@ -114,6 +114,7 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
 
     env_str = get_env_str()
     ssh_user = os.environ.get('SSH_USER', os.environ['USER'])
+    num_gpus_per_node = int(os.environ['NUM_GPUS_PER_NODE'])
     data_config_str = get_data_config_str(data_dir)
     for i, host in enumerate(host_list):
         distributed_args += f" --node_rank {i}"
@@ -133,6 +134,7 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
                                    bufsize=0)
         subprocs.append(subproc)
 
+    world_size = len(host_list) * num_gpus_per_node
     mem_allocs = []
     iter_time_ms = []
     is_oom = False
@@ -156,13 +158,13 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
             if iteration > 1 and skipped_iter == 0:
                 iter_time_ms.append(iter_time)
         elif skipped_iter == 0:
-            m = re.search("\[Rank 0\].*?max allocated:[ \t]+(\d+\.\d*)?", output)
+            m = re.search("max allocated:[ \t]+(\d+\.\d*)?", output)
             if m:
                 print("correct output", output)
                 mem_alloc = float(m[1])
                 mem_allocs.append(mem_alloc)
 
-        if len(iter_time_ms) > 3 and len(mem_allocs) > 3:
+        if len(iter_time_ms) > 3 and len(mem_allocs) > 3 * world_size:
             break
 
     for proc in subprocs:
@@ -173,7 +175,7 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
 
     if is_oom:
         return 0, 0
-    return iter_time_ms[-1], mem_allocs[-1] if mem_allocs else 0
+    return max(iter_time_ms), max(mem_allocs)
 
 def run_comm_helper(world_size):
     host_list = os.environ['HOST_LIST'].split(',')
@@ -292,7 +294,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Estimator benchmark argument')
     parser.add_argument('--model', type=str, choices=['small', 'medium', 'large'])
     parser.add_argument('--benchmark-type', type=str,
-                        choices=['single-gpu', 'vmp-single-machine'])
+                        choices=['single-gpu', 'vmp-single-machine', 'pmp-single-machine'])
     parser.add_argument('--num-layers', type=int, default=8)
     parser.add_argument('--data-dir', type=str, default=None)
     parser.add_argument('--fp16', action='store_true')
@@ -327,6 +329,11 @@ if __name__ == "__main__":
                            Config(micro_batch_size=1, global_batch_size=2, mp=2),
                            Config(micro_batch_size=4, global_batch_size=8, mp=4),
                            Config(micro_batch_size=4, global_batch_size=8, mp=8)]
+    elif args.benchmark_type == 'pmp-single-machine':
+        configs_to_test = [Config(micro_batch_size=1, global_batch_size=2, pp=1),
+                           Config(micro_batch_size=1, global_batch_size=4, pp=2),
+                           Config(micro_batch_size=2, global_batch_size=16, pp=4),
+                           Config(micro_batch_size=2, global_batch_size=16, pp=8)]
     else:
         raise NotImplementedError
 
