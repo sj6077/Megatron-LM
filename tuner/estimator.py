@@ -828,9 +828,12 @@ class Estimator:
         args = get_args()
         pp = args.pipeline_model_parallel_size
 
-        pp_warmup_comm_time_per_stage = {}
-        pp_steady_comm_time_per_stage = {}
+        pp_warmup_comm_time_per_stage = {0:0}
+        pp_steady_comm_time_per_stage = {0:0}
         pp_embedding_sync_time = 0
+        if pp == 1:
+            return pp_warmup_comm_time_per_stage, pp_steady_comm_time_per_stage, \
+                    pp_embedding_sync_time
 
         stage_ranks = {} # (mp, dp) -> list of ranks
         for mp in range(args.tensor_model_parallel_size):
@@ -839,9 +842,25 @@ class Estimator:
         for task, rank in self.curr_task_to_rank.items():
             stage_ranks[(task.mp, task.dp)][task.pp] = rank
 
+        assert pp % 2 == 0
+        all_send_recv_ranks = {}
+        send_recv_except_first_and_last_ranks = {}
+        for task, rank in self.curr_task_to_rank.items():
+            key = (task.mp, task.dp)
+            stage = task.pp
+            if task.pp % 2 == 0:
+                all_send_recv_ranks[rank] = [rank, stage_ranks[key][task.pp + 1]]
+                if stage != 0:
+                    send_recv_except_first_and_last_ranks[rank] = \
+                            [stage_ranks[key][task.pp - 1], rank]
+            else:
+                all_send_recv_ranks[rank] = [stage_ranks[key][task.pp - 1], rank]
+                if stage != pp - 1:
+                    send_recv_except_first_and_last_ranks[rank] = \
+                            [rank, stage_ranks[key][task.pp + 1]]
+
         tensor_dtype = torch.float16 if args.fp16 else torch.float32
         tensor_shape = [args.seq_length, args.micro_batch_size, args.hidden_size]
-
         for stage in range(pp):
             stage_rank = stage_ranks[(0, 0)][stage]
 
@@ -873,27 +892,23 @@ class Estimator:
                         CommType.SEND_OR_RECV, recv_backward_rank_to_comm_ranks,
                         tensor_dtype, tensor_shape)[stage_rank]
             pp_warmup_comm_time_per_stage[stage] = recv_forward + recv_backward
-                        
-            # steady after forward: recv_backward_send_forward
-            if stage == pp - 1:
-                recv_backward_send_forward = 0
-            else:
-                recv_backward_send_forward = self.comm_helper.request_comm(
-                        CommType.SEND_AND_RECV,
-                        recv_backward_rank_to_comm_ranks,
-                        tensor_dtype, tensor_shape)[stage_rank]
 
-            # steady after backward: recv_forward_send_backward
-            if stage == 0:
-                recv_forward_send_backward = 0
+            # steady: all_send_recv_ranks + send_recv_except_first_and_last_ranks
+            all_send_recv_time = self.comm_helper.request_comm(
+                    CommType.SEND_AND_RECV,
+                    all_send_recv_ranks,
+                    tensor_dtype, tensor_shape)[stage_rank]
+            if stage != 0 and stage != pp - 1:
+                send_recv_except_first_and_last_time = \
+                        self.comm_helper.request_comm(
+                                CommType.SEND_AND_RECV,
+                                send_recv_except_first_and_last_ranks,
+                                tensor_dtype, tensor_shape)[stage_rank]
             else:
-                recv_forward_send_backward = self.comm_helper.request_comm(
-                        CommType.SEND_AND_RECV,
-                        recv_forward_rank_to_comm_ranks,
-                        tensor_dtype, tensor_shape)[stage_rank]
+                send_recv_except_first_and_last_time = 0
 
             pp_steady_comm_time_per_stage[stage] = \
-                    recv_forward_send_backward + recv_backward_send_forward
+                    all_send_recv_time + send_recv_except_first_and_last_time
 
         if pp > 1:
             sync_embedding_rank_to_comm_ranks = {}

@@ -294,7 +294,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Estimator benchmark argument')
     parser.add_argument('--model', type=str, choices=['small', 'medium', 'large'])
     parser.add_argument('--benchmark-type', type=str,
-                        choices=['single-gpu', 'vmp-single-machine', 'pmp-single-machine'])
+                        choices=['single-gpu', 'vmp-single-machine', 'pmp-single-machine',
+                                 'vmp-and-pmp-single-machine'])
     parser.add_argument('--num-layers', type=int, default=8)
     parser.add_argument('--data-dir', type=str, default=None)
     parser.add_argument('--fp16', action='store_true')
@@ -334,6 +335,11 @@ if __name__ == "__main__":
                            Config(micro_batch_size=1, global_batch_size=4, pp=2),
                            Config(micro_batch_size=2, global_batch_size=16, pp=4),
                            Config(micro_batch_size=2, global_batch_size=16, pp=8)]
+    elif args.benchmark_type == 'vmp-and-pmp-single-machine':
+        configs_to_test = [Config(micro_batch_size=1, global_batch_size=2, mp=1, pp=8),
+                           Config(micro_batch_size=2, global_batch_size=4, mp=2, pp=4),
+                           Config(micro_batch_size=4, global_batch_size=16, mp=4, pp=2),
+                           Config(micro_batch_size=8, global_batch_size=16, mp=8, pp=1)]
     else:
         raise NotImplementedError
 
