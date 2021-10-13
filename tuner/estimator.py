@@ -104,32 +104,47 @@ def get_single_layer_model(model_provider, args_defaults=None):
     args.save = None
 
     # Get single transformer layer model
-    #original_num_layers = args.num_layers
-    #original_pp = args.pipeline_model_parallel_size
-
     optimizers = {}
     assert args.num_layers == args.pipeline_model_parallel_size == 1
-    def model_provider_with_pre_process(pre_process=True, post_process=True):
-        return model_provider(pre_process=True, post_process=False)
-    model_with_pre_process, optimizer_with_pre_process, _ = setup_model_and_optimizer(
-            model_provider_with_pre_process)
-
     def model_provider_without_pre_or_post_process(pre_process=True, post_process=True):
         return model_provider(pre_process=False, post_process=False)
     model, optimizer, _ = setup_model_and_optimizer(
             model_provider_without_pre_or_post_process)
+    unwrapped_model = unwrap_model(model, (torchDDP, LocalDDP, Float16Module))[0]
+    named_params = {}
+    for n, p in unwrapped_model.named_parameters():
+        named_params[n] = p
+
+    def model_provider_with_pre_process(pre_process=True, post_process=True):
+        new_model = model_provider(pre_process=True, post_process=False)
+        for n, p in new_model.named_parameters():
+            if n in named_params:
+                print("pre, same module", n)
+                p.data = named_params[n].data
+            else:
+                print("pre, diff module", n)
+        return new_model
+    model_with_pre_process, optimizer_with_pre_process, _ = setup_model_and_optimizer(
+            model_provider_with_pre_process)
+    unwrapped_model_with_pre_process = unwrap_model(
+            model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0]
 
     def model_provider_with_post_process(pre_process=True, post_process=True):
-        model = model_provider(pre_process=False, post_process=True)
-        return model
+        new_model = model_provider(pre_process=False, post_process=True)
+        for n, p in new_model.named_parameters():
+            if n in named_params:
+                print("post, same module", n)
+                p.data = named_params[n].data
+            else:
+                print("post, diff module", n)
+        return new_model
     model_with_post_process, optimizer_with_post_process, _ = setup_model_and_optimizer(
             model_provider_with_post_process)
+    # embedding set after optimizer is created so that the embedding is excluded from the optimizer
     unwrapped_model_with_post_process = unwrap_model(
-        model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0].language_model
-    orig_embedding = unwrap_model(
-        model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0].language_model.embedding
-    # set embedding for loss computation
-    unwrapped_model_with_post_process.embedding = orig_embedding
+            model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0]
+    unwrapped_model_with_post_process.language_model.embedding = \
+            unwrapped_model_with_pre_process.language_model.embedding
 
     models = Models(model_with_pre_process=model_with_pre_process,
                     model_without_pre_or_post_process=model,
@@ -138,7 +153,8 @@ def get_single_layer_model(model_provider, args_defaults=None):
     optimizers = Optimizers(optimizer_with_pre_process=optimizer_with_pre_process,
                             optimizer_without_pre_or_post_process=optimizer,
                             optimizer_with_post_process=optimizer_with_post_process)
-    return models, optimizers, orig_embedding.word_embeddings.weight.size()
+    embedding = unwrapped_model_with_pre_process.language_model.embedding
+    return models, optimizers, embedding.word_embeddings.weight.size()
 
 def get_train_dataset(dataset='gpt'):
     if dataset != 'gpt':
@@ -403,7 +419,7 @@ def get_param_and_grad_sizes(models: Models, optimizers: Optimizers):
         optimizers.optimizer_without_pre_or_post_process.get_parameters(),
         models.model_without_pre_or_post_process[0].parameters()])
 
-    # exclude embedding params
+    # exclude embedding params from post_process
     orig_embedding = unwrap_model(
         models.model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0].language_model.embedding
     unwrapped_model_with_post_process = unwrap_model(
