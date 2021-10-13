@@ -123,6 +123,7 @@ class DistributedWrapperContext:
     IS_MODEL_STARTED = False
     IS_MODEL_ENDED = False
     CURR_CONFIG = None
+    START_TIME = None
    
     def record_comm_logs():
         DistributedWrapperContext._START_RECORD_COMM = True
@@ -266,6 +267,7 @@ class DistributedWrapperContext:
 
 def forward_hook(module, input):
     DistributedWrapperContext.IS_MODEL_STARTED = True
+    DistributedWrapperContext.START_TIME = time.time()
 
 def backward_hook(module, grad_input, grad_output):
     DistributedWrapperContext.IS_MODEL_ENDED = True 
@@ -357,14 +359,15 @@ def get_forward_step_time(forward_step_func, train_data_iterator,
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
-
+    
+    s = time.time()
     output, loss_func = forward_step_func(train_data_iterator, model)
     if compute_loss:
         output = loss_func(output)
         loss, loss_reduced = output
         output = loss
 
-    return output
+    return output, DistributedWrapperContext.START_TIME - s
 
 def get_backward_step_time(optimizer, input_tensor,
                            output_tensor, output_tensor_grad):
@@ -436,7 +439,7 @@ def do_forward_backward(num_gpus_per_node, forward_step_func, models,
             DistributedWrapperContext.record_comm_logs()
 
         # do forward
-        output = get_forward_step_time(
+        output, get_batch_time = get_forward_step_time(
                 forward_step_func,
                 train_data_iterator,
                 model,
@@ -470,6 +473,8 @@ def do_forward_backward(num_gpus_per_node, forward_step_func, models,
 
     torch_cuda_synchronize()
     e = time.time()
+    if not pre_process:
+        e -= get_batch_time
     forward_backward_time = (e - s) / NUM_AVERAGE
     return forward_backward_time, activation_shape, activation_size, peak_memory, forward_backward_comm_logs
 
