@@ -80,7 +80,7 @@ class CommHelper:
         world_size = int(os.environ['WORLD_SIZE'])
         rank = int(os.environ['RANK'])
         local_rank = int(os.environ['LOCAL_RANK'])
-        torch.cuda.set_device(local_rank)
+        self.local_rank = local_rank
         
         torch.distributed.init_process_group(
                 backend='gloo',
@@ -146,6 +146,8 @@ class CommHelper:
         return self.comm_group[key]
 
     def _handle_comm(self, comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape):
+        torch.cuda.set_device(self.local_rank)
+
         """Execute given communication and send the communication time to rank0"""
         print(self.my_rank, comm_type, tensor_dtype, tensor_shape, rank_to_comm_ranks)
         if self.my_rank == 0:

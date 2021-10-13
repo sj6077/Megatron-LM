@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
 import math
+import multiprocessing
 import os
 import sys
 import time
@@ -96,47 +97,41 @@ def dummy_handler():
     finally:
         pass
 
-def get_single_layer_model(model_provider, args_defaults=None):
+def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None):
 
     args = get_args()
     # disable save and load checkpoints
     args.load = None
     args.save = None
 
-    # Get single transformer layer model
-    optimizers = {}
-    assert args.num_layers == args.pipeline_model_parallel_size == 1
-    def model_provider_without_pre_or_post_process(pre_process=True, post_process=True):
-        return model_provider(pre_process=False, post_process=False)
-    model, optimizer, _ = setup_model_and_optimizer(
-            model_provider_without_pre_or_post_process)
-    unwrapped_model = unwrap_model(model, (torchDDP, LocalDDP, Float16Module))[0]
-    named_params = {}
-    for n, p in unwrapped_model.named_parameters():
-        named_params[n] = p
-
+    pre_process_device = 0
+    torch.cuda.set_device(pre_process_device)
     def model_provider_with_pre_process(pre_process=True, post_process=True):
         new_model = model_provider(pre_process=True, post_process=False)
-        for n, p in new_model.named_parameters():
-            if n in named_params:
-                print("pre, same module", n)
-                p.data = named_params[n].data
-            else:
-                print("pre, diff module", n)
         return new_model
     model_with_pre_process, optimizer_with_pre_process, _ = setup_model_and_optimizer(
             model_provider_with_pre_process)
     unwrapped_model_with_pre_process = unwrap_model(
             model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0]
+    embedding = unwrapped_model_with_pre_process.language_model.embedding
 
+    single_layer_device = min(num_gpus_per_node - 1, 1)
+    torch.cuda.set_device(single_layer_device)
+    # Get single transformer layer model
+    assert args.num_layers == args.pipeline_model_parallel_size == 1
+    def model_provider_without_pre_or_post_process(pre_process=True, post_process=True):
+        return model_provider(pre_process=False, post_process=False)
+    model, optimizer, _ = setup_model_and_optimizer(
+            model_provider_without_pre_or_post_process)
+
+    post_process_device = min(num_gpus_per_node - 1, 2)
+    torch.cuda.set_device(post_process_device)
+    if pre_process_device != post_process_device:
+        tmp_pre_process_model = model_provider(pre_process=True, post_process=False)
+        embedding = tmp_pre_process_model.language_model.embedding
+        del tmp_pre_process_model
     def model_provider_with_post_process(pre_process=True, post_process=True):
         new_model = model_provider(pre_process=False, post_process=True)
-        for n, p in new_model.named_parameters():
-            if n in named_params:
-                print("post, same module", n)
-                p.data = named_params[n].data
-            else:
-                print("post, diff module", n)
         return new_model
     model_with_post_process, optimizer_with_post_process, _ = setup_model_and_optimizer(
             model_provider_with_post_process)
@@ -144,7 +139,7 @@ def get_single_layer_model(model_provider, args_defaults=None):
     unwrapped_model_with_post_process = unwrap_model(
             model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0]
     unwrapped_model_with_post_process.language_model.embedding = \
-            unwrapped_model_with_pre_process.language_model.embedding
+            embedding
 
     models = Models(model_with_pre_process=model_with_pre_process,
                     model_without_pre_or_post_process=model,
@@ -220,7 +215,6 @@ def get_backward_step_time(comm_logs, optimizer, input_tensor,
 
 def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOptimizer):
     assert len(comm_logs) == 0
-
     for param in model.parameters():
         if param.requires_grad:
             if optimizer.params_have_main_grad:
@@ -239,20 +233,24 @@ def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOpt
     opt_time = (e - s) / NUM_AVERAGE
     return opt_time
 
-def do_forward_backward(comm_logs, forward_step_func, models,
+def do_forward_backward(num_gpus_per_node, comm_logs, forward_step_func, models,
                         optimizers, train_data_iterator,
                         pre_process=False, post_process=False,
                         input_tensor_shape=None):
+
     if pre_process:
+        torch.cuda.set_device(0)
         input_tensor = None
         model = models.model_with_pre_process[0]
         optimizer = optimizers.optimizer_with_pre_process
     elif post_process:
+        torch.cuda.set_device(min(num_gpus_per_node - 1, 2))
         input_tensor = torch.randn(list(input_tensor_shape)).cuda()
         input_tensor.requires_grad = True
         model = models.model_with_post_process[0]
         optimizer = optimizers.optimizer_with_post_process
     else:
+        torch.cuda.set_device(min(num_gpus_per_node - 1, 1))
         input_tensor = torch.randn(list(input_tensor_shape)).cuda()
         input_tensor.requires_grad = True
         model = models.model_without_pre_or_post_process[0]
@@ -598,6 +596,11 @@ class DistributedWrapperContext:
         setattr(dist, 'broadcast', DistributedWrapperContext._DEFAULT_BROADCAST)
         setattr(torch.cuda, 'synchronize', torch_cuda_synchronize)
 
+def run_comm_helper(env):
+    os.environ = env
+    comm_helper = CommHelper()
+    comm_helper.run_msg_handler()
+
 class Estimator:
     def __init__(self, world_size, num_gpus_per_node, model_name='gpt'):
         self.world_size = world_size
@@ -613,16 +616,41 @@ class Estimator:
         self.activation_size = {}  # (mp, mb) -> activation size
         self.peak_memories = {}  # (mp, mb) -> peak memory
 
-        self.comm_helper = CommHelper()
         self.curr_task_to_rank = {}
 
         self.mp_forward_backward_comm_logs = defaultdict(Log) # (mp, mb) -> mp comm logs for forward and backward
-        #self.mp_forward_backward_times = {} # (mp, mb, num_node) -> mp_comm_time for forward and backward
 
         self.curr_mp = None
         self.models = None
         self.optimizers = None
         self.embedding_shape = None
+        
+        node_rank = int(os.environ['NODE_RANK'])
+        procs = []
+        rank = node_rank * num_gpus_per_node
+        for local_rank in range(num_gpus_per_node):
+            print("handle for local rank", local_rank)
+            if rank == 0:
+                rank += 1
+                continue
+            ctx = multiprocessing.get_context('spawn')
+            env = os.environ.copy()
+            env['RANK'] = str(rank)
+            env['LOCAL_RANK'] = str(local_rank)
+            proc = ctx.Process(
+                    target=run_comm_helper,
+                    args=(env,))
+            procs.append(proc)
+            proc.start()
+            rank += 1
+
+        if node_rank == 0:
+            os.environ['RANK'] = '0'
+            os.environ['LOCAL_RANK'] = '0'
+            self.comm_helper = CommHelper()
+        else:
+            for proc in procs:
+                proc.join()
 
     def __enter__(self):
         DistributedWrapperContext.patch_dist_func(self.world_size)
@@ -673,6 +701,7 @@ class Estimator:
             self.models, self.optimizers, self.embedding_shape = \
                     get_single_layer_model(
                     gpt_model_provider,
+                    self.num_gpus_per_node,
                     args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
 
             args.pipeline_model_parallel_size = original_pp
@@ -694,6 +723,7 @@ class Estimator:
 
         model = models.model_with_pre_process[0]
         optimizer = optimizers.optimizer_with_pre_process
+        torch.cuda.set_device(0)
         pre_process_optimizer_time = get_optimizer_time(
                 DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
@@ -704,6 +734,7 @@ class Estimator:
 
         model = models.model_with_post_process[0]
         optimizer = optimizers.optimizer_with_post_process
+        torch.cuda.set_device(min(self.num_gpus_per_node - 1, 2))
         post_process_optimizer_time = get_optimizer_time(
                 DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
@@ -714,6 +745,7 @@ class Estimator:
 
         model = models.model_without_pre_or_post_process[0]
         optimizer = optimizers.optimizer_without_pre_or_post_process
+        torch.cuda.set_device(min(self.num_gpus_per_node - 1, 1))
         single_layer_optimizer_time = get_optimizer_time(
                 DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
@@ -988,7 +1020,8 @@ class Estimator:
         with context_handler():
             pre_process_forward_backward_time, \
                     activation_shape, _, pre_process_peak_memory, pre_process_comm_logs = \
-                do_forward_backward(DistributedWrapperContext._COMM_CALLED,
+                do_forward_backward(self.num_gpus_per_node,
+                                    DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, pre_process=True)
             self._set_comm_logs(pre_process_comm_logs, pre_process=True)
@@ -996,14 +1029,16 @@ class Estimator:
             single_layer_forward_backward_time, \
                     activation_shape, activation_size, single_layer_peak_memory, \
                     single_layer_comm_logs = \
-                do_forward_backward(DistributedWrapperContext._COMM_CALLED,
+                do_forward_backward(self.num_gpus_per_node,
+                                    DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, input_tensor_shape=activation_shape)
             self._set_comm_logs(single_layer_comm_logs)
 
             post_process_forward_backward_time, \
                     _, _, post_process_peak_memory, post_process_comm_logs = \
-                do_forward_backward(DistributedWrapperContext._COMM_CALLED,
+                do_forward_backward(self.num_gpus_per_node,
+                                    DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, post_process=True,
                                     input_tensor_shape=activation_shape)

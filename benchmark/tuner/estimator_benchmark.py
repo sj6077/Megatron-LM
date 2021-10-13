@@ -177,58 +177,38 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
         return 0, 0
     return max(iter_time_ms), max(mem_allocs)
 
-def run_comm_helper(world_size):
-    host_list = os.environ['HOST_LIST'].split(',')
-    subprocs = []
-
-    env_str = get_env_str()
-    ssh_user = os.environ['SSH_USER']
-    num_gpus_per_node = int(os.environ['NUM_GPUS_PER_NODE'])
-    env_str += f" MASTER_ADDR={host_list[0]}"
-    env_str += f" MASTER_PORT={os.environ['MASTER_PORT']}"
-    env_str += f" WORLD_SIZE={world_size}"
-    rank = 0
-    for i, host in enumerate(host_list):
-        for local_rank in range(num_gpus_per_node):
-            if rank != 0:
-                proc_env_str = f"{env_str} RANK={rank} LOCAL_RANK={local_rank}"
-                full_cmd = f"ssh {ssh_user}@{host} "\
-                           f"{proc_env_str} python {os.getcwd()}/benchmark/tuner/run_comm_helper.py"
-                subproc = subprocess.Popen([full_cmd],
-                                           shell=True)
-                subprocs.append(subproc)
-            rank += 1
-            if rank == world_size:
-                break
-    return subprocs
-
 def estimator_run(data_dir, model, world_size, configs_to_test, env, queue):
     os.environ = env
     num_gpus_per_node = int(os.environ['NUM_GPUS_PER_NODE'])
-    mock_argv = get_mock_argv_and_set_master_env(data_dir, model, world_size)
-    run_comm_helper(world_size)
-    setattr(sys, 'argv', mock_argv)
-    try:
-        with Estimator(world_size, min(num_gpus_per_node, world_size)) as estimator:
-            for config in configs_to_test:
-                assert config.mp * config.dp * config.pp == world_size
+    node_rank = int(os.environ['NODE_RANK'])
+    print("create estimator for node rank", node_rank)
+    if node_rank == 0:
+        mock_argv = get_mock_argv_and_set_master_env(data_dir, model, world_size)
+        setattr(sys, 'argv', mock_argv)
+        try:
+            with Estimator(world_size, min(num_gpus_per_node, world_size)) as estimator:
+                for config in configs_to_test:
+                    assert config.mp * config.dp * config.pp == world_size
 
-                estimated_iter_time = estimator.get_iter_time(config)
-                if estimated_iter_time == 0: # OOM
-                    estimated_gpu_memory = 0
-                else:
-                    estimated_gpu_memory = estimator.get_max_gpu_memory(config)
+                    estimated_iter_time = estimator.get_iter_time(config)
+                    if estimated_iter_time == 0: # OOM
+                        estimated_gpu_memory = 0
+                    else:
+                        estimated_gpu_memory = estimator.get_max_gpu_memory(config)
 
-                queue.put((estimated_iter_time, estimated_gpu_memory))
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            for _ in configs_to_test:
-                queue.put((0, 0))
-        else:
-            raise e
+                    queue.put((estimated_iter_time, estimated_gpu_memory))
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                for _ in configs_to_test:
+                    queue.put((0, 0))
+            else:
+                raise e
+    else:
+        estimator = Estimator(world_size, min(num_gpus_per_node, world_size))
 
 def get_estimated_iter_time_and_memory(data_dir, model, world_size, configs_to_test):
     ctx = multiprocessing.get_context('spawn')
+    node_rank = int(os.environ['NODE_RANK'])
     queue = ctx.Queue()
     child_env = os.environ.copy()
     proc = ctx.Process(
@@ -236,8 +216,9 @@ def get_estimated_iter_time_and_memory(data_dir, model, world_size, configs_to_t
             args=(data_dir, model, world_size, configs_to_test, child_env, queue,))
     proc.start()
     result = {}
-    for config in configs_to_test:
-        result[config] = queue.get()
+    if node_rank == 0:
+        for config in configs_to_test:
+            result[config] = queue.get()
     proc.join()
     return result
 
@@ -265,6 +246,10 @@ def run_estimator_benchmark(data_dir, model, configs_to_test):
                         global_batch_size=config.global_batch_size,
                         micro_batch_size=config.micro_batch_size)
         actual_results.append((actual_iter_time, actual_gpu_memory))
+
+    node_rank = int(os.environ['NODE_RANK'])
+    if node_rank != 0:
+        return
 
     for config, actual in zip(configs_to_test, actual_results):
         estimated_iter_time, estimated_gpu_memory = estimation_results[config]
@@ -311,6 +296,8 @@ if __name__ == "__main__":
         os.environ['NUM_GPUS_PER_NODE'] = '8'
     if 'MASTER_PORT' not in os.environ:
         os.environ['MASTER_PORT'] = '8000'
+    if 'NODE_RANK' not in os.environ:
+        os.environ['NODE_RANK'] = '0'
 
     if args.model == 'small':
         model = get_345m_model(fp16=args.fp16, num_layers=args.num_layers)
