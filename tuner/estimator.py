@@ -97,6 +97,179 @@ def dummy_handler():
     finally:
         pass
 
+@dataclass(frozen=True)
+class Config:
+    micro_batch_size: int
+    global_batch_size: int
+    dp: int = 1
+    mp: int = 1
+    pp: int = 1
+    parallelism_order: str = 'dp,pp,mp'
+
+class DistributedWrapperContext:
+    _DEFAULT_INIT = dist.init_process_group
+    _DEFAULT_IS_INIT = dist.is_initialized
+    _DEFAULT_NEW_GROUP = dist.new_group
+    _DEFAULT_WORLD_SIZE = dist.get_world_size
+    _DEFAULT_RANK = dist.get_rank
+    _DEFAULT_BARRIER = dist.barrier
+    _DEFAULT_ALLREDUCE = dist.all_reduce
+    _DEFAULT_BROADCAST = dist.broadcast
+    _DUMMY_GROUPS = {}
+    _BEFORE_MODEL_START = defaultdict(list) # comm_group -> comm_type, tensor_dtype, tensor_shape
+    _AFTER_MODEL_END = defaultdict(list) # comm_group -> comm_type, tensor_dtype, tensor_shape
+    _WITHIN_MODEL = defaultdict(list) # comm_group -> comm_type, tensor_dtype, tensor_shape
+    _START_RECORD_COMM = False
+    IS_MODEL_STARTED = False
+    IS_MODEL_ENDED = False
+    CURR_CONFIG = None
+   
+    def record_comm_logs():
+        DistributedWrapperContext._START_RECORD_COMM = True
+        DistributedWrapperContext.IS_MODEL_STARTED = False
+        DistributedWrapperContext.IS_MODEL_ENDED = False
+
+    def new_group(*args, **kwargs):
+        ranks = args[0]
+        assert ranks is not None
+
+        group_name = f"dummy_group{len(DistributedWrapperContext._DUMMY_GROUPS)}"
+        DistributedWrapperContext._DUMMY_GROUPS[group_name] = len(ranks)
+        return group_name
+
+    def convert_group(group):
+        assert group is not None
+
+        if not group.startswith('dummy_group'):
+            return group
+
+        if group == mpu.get_model_parallel_group():
+            new_group = "model_parallel_group"
+        elif group == mpu.get_data_parallel_group():
+            new_group = "data_parallel_group"
+        elif group == mpu.get_embedding_group():
+            new_group = "embedding_group"
+        elif group == mpu.get_tensor_model_parallel_group():
+            new_group = "tensor_model_parallel_group"
+        else:
+            assert group == mpu.get_pipeline_model_parallel_group()
+            new_group = "pipeline_model_parallel_group"
+
+        return new_group
+
+    def get_world_size(world_size):
+        def _get_world_size(group=None):
+            if group is None:
+                return world_size
+            new_group = DistributedWrapperContext.convert_group(group)
+            curr_config = DistributedWrapperContext.CURR_CONFIG
+            if curr_config is None:
+                return DistributedWrapperContext._DUMMY_GROUPS[group]
+
+            if new_group ==  "model_parallel_group":
+                return curr_config.pp * curr_config.mp
+            elif new_group == "data_parallel_group":
+                return curr_config.dp
+            elif new_group == "embedding_group":
+                return 0 if curr_config.pp == 1 else 2
+            elif new_group == "tensor_model_parallel_group":
+                return curr_config.mp
+            else:
+                assert new_group == "pipeline_model_parallel_group"
+                return curr_config.pp
+        return _get_world_size
+
+    def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
+        if not DistributedWrapperContext._START_RECORD_COMM:
+            return
+
+        if not DistributedWrapperContext.IS_MODEL_STARTED:
+            comm_dict = DistributedWrapperContext._BEFORE_MODEL_START
+        elif DistributedWrapperContext.IS_MODEL_ENDED:
+            comm_dict = DistributedWrapperContext._AFTER_MODEL_END
+        else:
+            comm_dict = DistributedWrapperContext._WITHIN_MODEL
+
+        comm_group = DistributedWrapperContext.convert_group(group)
+        comm_dict[comm_group].append((
+            CommType.ALLREDUCE, tensor.dtype, list(tensor.size())))
+
+    def broadcast(tensor, src, group=None, async_op=False):
+        if not DistributedWrapperContext._START_RECORD_COMM:
+            return
+
+        if not DistributedWrapperContext.IS_MODEL_STARTED:
+            comm_dict = DistributedWrapperContext._BEFORE_MODEL_START
+        elif DistributedWrapperContext.IS_MODEL_ENDED:
+            comm_dict = DistributedWrapperContext._AFTER_MODEL_END
+        else:
+            comm_dict = DistributedWrapperContext._WITHIN_MODEL
+        comm_group = DistributedWrapperContext.convert_group(group)
+        comm_dict[comm_group].append((
+                CommType.BROADCAST, tensor.dtype, list(tensor.size())))
+
+    def get_comm_logs(pre_process, post_process):
+        assert DistributedWrapperContext._START_RECORD_COMM
+        print(DistributedWrapperContext.CURR_CONFIG)
+        print("before model start comm logs", DistributedWrapperContext._BEFORE_MODEL_START)
+        print("within model comm logs", DistributedWrapperContext._WITHIN_MODEL)
+        print("after model end comm logs", DistributedWrapperContext._AFTER_MODEL_END)
+        if pre_process:
+            comm_logs = DistributedWrapperContext._BEFORE_MODEL_START.copy()
+        elif post_process:
+            comm_logs = DistributedWrapperContext._AFTER_MODEL_END.copy()
+        else:
+            comm_logs = {}
+        for comm_group, comm_log_list in DistributedWrapperContext._WITHIN_MODEL.items():
+            if comm_group not in comm_logs:
+                comm_logs[comm_group] = comm_log_list.copy()
+            else:
+                comm_logs[comm_group] += comm_log_list
+        DistributedWrapperContext.reset_comm_logs()
+        return comm_logs
+
+    def reset_comm_logs():
+        DistributedWrapperContext._BEFORE_MODEL_START.clear()
+        DistributedWrapperContext._AFTER_MODEL_END.clear()
+        DistributedWrapperContext._WITHIN_MODEL.clear()
+
+        DistributedWrapperContext._START_RECORD_COMM = False
+
+    def dummy_func_with_return(return_value=None):
+        def dummy_func(*args, **kwargs):
+            return return_value
+        return dummy_func
+
+    @staticmethod
+    def patch_dist_func(world_size):
+        setattr(dist, 'init_process_group', DistributedWrapperContext.dummy_func_with_return())
+        setattr(dist, 'is_initialized', DistributedWrapperContext.dummy_func_with_return(True))
+        setattr(dist, 'new_group', DistributedWrapperContext.new_group)
+        setattr(dist, 'get_world_size', DistributedWrapperContext.get_world_size(world_size))
+        setattr(dist, 'get_rank', DistributedWrapperContext.dummy_func_with_return(0))
+        setattr(dist, 'barrier', DistributedWrapperContext.dummy_func_with_return())
+        setattr(dist, 'all_reduce', DistributedWrapperContext.all_reduce)
+        setattr(dist, 'broadcast', DistributedWrapperContext.broadcast)
+        setattr(torch.cuda, 'synchronize', DistributedWrapperContext.dummy_func_with_return())
+
+    @staticmethod
+    def unpatch_dist_func():
+        setattr(dist, 'init_process_group', DistributedWrapperContext._DEFAULT_INIT)
+        setattr(dist, 'is_initialized', DistributedWrapperContext._DEFAULT_IS_INIT)
+        setattr(dist, 'new_group', DistributedWrapperContext._DEFAULT_NEW_GROUP)
+        setattr(dist, 'get_world_size', DistributedWrapperContext._DEFAULT_WORLD_SIZE)
+        setattr(dist, 'get_rank', DistributedWrapperContext._DEFAULT_RANK)
+        setattr(dist, 'barrier', DistributedWrapperContext._DEFAULT_BARRIER)
+        setattr(dist, 'all_reduce', DistributedWrapperContext._DEFAULT_ALLREDUCE)
+        setattr(dist, 'broadcast', DistributedWrapperContext._DEFAULT_BROADCAST)
+        setattr(torch.cuda, 'synchronize', torch_cuda_synchronize)
+
+def forward_hook(module, input):
+    DistributedWrapperContext.IS_MODEL_STARTED = True
+
+def backward_hook(module, grad_input, grad_output):
+    DistributedWrapperContext.IS_MODEL_ENDED = True 
+
 def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None):
 
     args = get_args()
@@ -111,6 +284,8 @@ def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None
         return new_model
     model_with_pre_process, optimizer_with_pre_process, _ = setup_model_and_optimizer(
             model_provider_with_pre_process)
+    model_with_pre_process[0].register_forward_pre_hook(forward_hook)
+    model_with_pre_process[0].register_backward_hook(backward_hook)
     unwrapped_model_with_pre_process = unwrap_model(
             model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0]
     embedding = unwrapped_model_with_pre_process.language_model.embedding
@@ -123,6 +298,8 @@ def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None
         return model_provider(pre_process=False, post_process=False)
     model, optimizer, _ = setup_model_and_optimizer(
             model_provider_without_pre_or_post_process)
+    model[0].register_forward_pre_hook(forward_hook)
+    model[0].register_backward_hook(backward_hook)
 
     post_process_device = min(num_gpus_per_node - 1, 2)
     torch.cuda.set_device(post_process_device)
@@ -135,6 +312,8 @@ def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None
         return new_model
     model_with_post_process, optimizer_with_post_process, _ = setup_model_and_optimizer(
             model_provider_with_post_process)
+    model_with_post_process[0].register_forward_pre_hook(forward_hook)
+    model_with_post_process[0].register_backward_hook(backward_hook)
     # embedding set after optimizer is created so that the embedding is excluded from the optimizer
     unwrapped_model_with_post_process = unwrap_model(
             model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0]
@@ -173,15 +352,11 @@ def get_train_data_iterator(train_data_iterator):
     train_data_iterator = iter(cyclic_iter(train_dataloader))
     return train_data_iterator
 
-def get_forward_step_time(comm_logs, forward_step_func, train_data_iterator,
+def get_forward_step_time(forward_step_func, train_data_iterator,
                           model, input_tensor, compute_loss = False):
-    assert len(comm_logs) == 0
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
-
-    # keep only the last communication logs
-    comm_logs.clear()
 
     output, loss_func = forward_step_func(train_data_iterator, model)
     if compute_loss:
@@ -191,16 +366,13 @@ def get_forward_step_time(comm_logs, forward_step_func, train_data_iterator,
 
     return output
 
-def get_backward_step_time(comm_logs, optimizer, input_tensor,
+def get_backward_step_time(optimizer, input_tensor,
                            output_tensor, output_tensor_grad):
-    assert len(comm_logs) == 0
     args = get_args()
 
     # Retain the grad on the input_tensor.
     if input_tensor is not None:
         input_tensor.retain_grad()
-
-    comm_logs.clear()
 
     # Backward pass.
     if output_tensor_grad is None:
@@ -213,8 +385,7 @@ def get_backward_step_time(comm_logs, optimizer, input_tensor,
         input_tensor_grad = input_tensor.grad
     return input_tensor_grad
 
-def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOptimizer):
-    assert len(comm_logs) == 0
+def get_optimizer_time(model: torch.nn.Module, optimizer: MegatronOptimizer):
     for param in model.parameters():
         if param.requires_grad:
             if optimizer.params_have_main_grad:
@@ -223,7 +394,6 @@ def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOpt
                 param.grad = torch.randn(list(param.size()), dtype=param.dtype).cuda()
 
     for i in range(NUM_AVERAGE + 1):
-        comm_logs.clear()
         if i == 1:
             torch_cuda_synchronize()
             s = time.time()
@@ -233,11 +403,12 @@ def get_optimizer_time(comm_logs, model: torch.nn.Module, optimizer: MegatronOpt
     opt_time = (e - s) / NUM_AVERAGE
     return opt_time
 
-def do_forward_backward(num_gpus_per_node, comm_logs, forward_step_func, models,
+def do_forward_backward(num_gpus_per_node, forward_step_func, models,
                         optimizers, train_data_iterator,
                         pre_process=False, post_process=False,
                         input_tensor_shape=None):
 
+    print("run model start", pre_process, post_process)
     if pre_process:
         torch.cuda.set_device(0)
         input_tensor = None
@@ -256,23 +427,22 @@ def do_forward_backward(num_gpus_per_node, comm_logs, forward_step_func, models,
         model = models.model_without_pre_or_post_process[0]
         optimizer = optimizers.optimizer_without_pre_or_post_process
 
+
     # do forward and backward to get peak memory
     for i in range(NUM_AVERAGE + 1):
         if i == 0:
             torch.cuda.reset_max_memory_allocated()
             torch.cuda.reset_peak_memory_stats()
+            DistributedWrapperContext.record_comm_logs()
 
         # do forward
         output = get_forward_step_time(
-                comm_logs,
                 forward_step_func,
                 train_data_iterator,
                 model,
                 input_tensor,
                 compute_loss=post_process)
         if i == 0:
-            forward_backward_comm_logs = comm_logs.copy()
-
             activation_shape = output.size()
             activation_size = output.nelement() * output.element_size()
 
@@ -282,27 +452,21 @@ def do_forward_backward(num_gpus_per_node, comm_logs, forward_step_func, models,
             else:
                 output_tensor_grad = torch.randn(list(activation_shape)).cuda()
                 output_tensor_grad.requires_grad = True
-        comm_logs.clear()
 
         get_backward_step_time(
-                comm_logs,
                 optimizer,
                 input_tensor,
                 output,
                 output_tensor_grad)
 
         if i == 0:
-            for group, logs in comm_logs.items():
-                if group not in forward_backward_comm_logs:
-                    forward_backward_comm_logs[group] = logs
-                else:
-                    forward_backward_comm_logs[group] += logs
+            forward_backward_comm_logs = \
+                    DistributedWrapperContext.get_comm_logs(
+                    pre_process, post_process)
 
             torch_cuda_synchronize()
             peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
             s = time.time()
-
-        comm_logs.clear()
 
     torch_cuda_synchronize()
     e = time.time()
@@ -485,117 +649,6 @@ def get_required_gpu_memory(param_sizes, grad_sizes, activation_size, peak_memor
     print("param_size", param_size, "peak_memory", peak_memory, "checkpoint_size", checkpoint_size, "grad_size", grad_size)
     return param_size + peak_memory + checkpoint_size + grad_size
 
-@dataclass(frozen=True)
-class Config:
-    micro_batch_size: int
-    global_batch_size: int
-    dp: int = 1
-    mp: int = 1
-    pp: int = 1
-    parallelism_order: str = 'dp,pp,mp'
-
-class DistributedWrapperContext:
-    _DEFAULT_INIT = dist.init_process_group
-    _DEFAULT_IS_INIT = dist.is_initialized
-    _DEFAULT_NEW_GROUP = dist.new_group
-    _DEFAULT_WORLD_SIZE = dist.get_world_size
-    _DEFAULT_RANK = dist.get_rank
-    _DEFAULT_BARRIER = dist.barrier
-    _DEFAULT_ALLREDUCE = dist.all_reduce
-    _DEFAULT_BROADCAST = dist.broadcast
-    _DUMMY_GROUPS = {}
-    _COMM_CALLED = defaultdict(list) # comm_group -> comm_type, tensor_dtype, tensor_shape
-    CURR_CONFIG = None
-   
-    def new_group(*args, **kwargs):
-        ranks = args[0]
-        assert ranks is not None
-
-        group_name = f"dummy_group{len(DistributedWrapperContext._DUMMY_GROUPS)}"
-        DistributedWrapperContext._DUMMY_GROUPS[group_name] = len(ranks)
-        return group_name
-
-    def convert_group(group):
-        assert group is not None
-
-        if not group.startswith('dummy_group'):
-            return group
-
-        if group == mpu.get_model_parallel_group():
-            new_group = "model_parallel_group"
-        elif group == mpu.get_data_parallel_group():
-            new_group = "data_parallel_group"
-        elif group == mpu.get_embedding_group():
-            new_group = "embedding_group"
-        elif group == mpu.get_tensor_model_parallel_group():
-            new_group = "tensor_model_parallel_group"
-        else:
-            assert group == mpu.get_pipeline_model_parallel_group()
-            new_group = "pipeline_model_parallel_group"
-
-        return new_group
-
-    def get_world_size(world_size):
-        def _get_world_size(group=None):
-            if group is None:
-                return world_size
-            new_group = DistributedWrapperContext.convert_group(group)
-            curr_config = DistributedWrapperContext.CURR_CONFIG
-            if curr_config is None:
-                return DistributedWrapperContext._DUMMY_GROUPS[group]
-
-            if new_group ==  "model_parallel_group":
-                return curr_config.pp * curr_config.mp
-            elif new_group == "data_parallel_group":
-                return curr_config.dp
-            elif new_group == "embedding_group":
-                return 0 if curr_config.pp == 1 else 2
-            elif new_group == "tensor_model_parallel_group":
-                return curr_config.mp
-            else:
-                assert new_group == "pipeline_model_parallel_group"
-                return curr_config.pp
-        return _get_world_size
-
-    def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
-        comm_group = DistributedWrapperContext.convert_group(group)
-        DistributedWrapperContext._COMM_CALLED[comm_group].append((
-                CommType.ALLREDUCE, tensor.dtype, list(tensor.size())))
-
-    def broadcast(tensor, src, group=None, async_op=False):
-        comm_group = DistributedWrapperContext.convert_group(group)
-        DistributedWrapperContext._COMM_CALLED[comm_group].append((
-                CommType.BROADCAST, tensor.dtype, list(tensor.size())))
-
-    def dummy_func_with_return(return_value=None):
-        def dummy_func(*args, **kwargs):
-            return return_value
-        return dummy_func
-
-    @staticmethod
-    def patch_dist_func(world_size):
-        setattr(dist, 'init_process_group', DistributedWrapperContext.dummy_func_with_return())
-        setattr(dist, 'is_initialized', DistributedWrapperContext.dummy_func_with_return(True))
-        setattr(dist, 'new_group', DistributedWrapperContext.new_group)
-        setattr(dist, 'get_world_size', DistributedWrapperContext.get_world_size(world_size))
-        setattr(dist, 'get_rank', DistributedWrapperContext.dummy_func_with_return(0))
-        setattr(dist, 'barrier', DistributedWrapperContext.dummy_func_with_return())
-        setattr(dist, 'all_reduce', DistributedWrapperContext.all_reduce)
-        setattr(dist, 'broadcast', DistributedWrapperContext.broadcast)
-        setattr(torch.cuda, 'synchronize', DistributedWrapperContext.dummy_func_with_return())
-
-    @staticmethod
-    def unpatch_dist_func():
-        setattr(dist, 'init_process_group', DistributedWrapperContext._DEFAULT_INIT)
-        setattr(dist, 'is_initialized', DistributedWrapperContext._DEFAULT_IS_INIT)
-        setattr(dist, 'new_group', DistributedWrapperContext._DEFAULT_NEW_GROUP)
-        setattr(dist, 'get_world_size', DistributedWrapperContext._DEFAULT_WORLD_SIZE)
-        setattr(dist, 'get_rank', DistributedWrapperContext._DEFAULT_RANK)
-        setattr(dist, 'barrier', DistributedWrapperContext._DEFAULT_BARRIER)
-        setattr(dist, 'all_reduce', DistributedWrapperContext._DEFAULT_ALLREDUCE)
-        setattr(dist, 'broadcast', DistributedWrapperContext._DEFAULT_BROADCAST)
-        setattr(torch.cuda, 'synchronize', torch_cuda_synchronize)
-
 def run_comm_helper(env):
     os.environ = env
     comm_helper = CommHelper()
@@ -725,34 +778,19 @@ class Estimator:
         optimizer = optimizers.optimizer_with_pre_process
         torch.cuda.set_device(0)
         pre_process_optimizer_time = get_optimizer_time(
-                DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
-        for comms_to_measure in DistributedWrapperContext._COMM_CALLED.values():
-            for _, _, tensor_shape in comms_to_measure:
-                assert tensor_shape == [1]
-        DistributedWrapperContext._COMM_CALLED.clear()
 
         model = models.model_with_post_process[0]
         optimizer = optimizers.optimizer_with_post_process
         torch.cuda.set_device(min(self.num_gpus_per_node - 1, 2))
         post_process_optimizer_time = get_optimizer_time(
-                DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
-        for comms_to_measure in DistributedWrapperContext._COMM_CALLED.values():
-            for _, _, tensor_shape in comms_to_measure:
-                assert tensor_shape == [1]
-        DistributedWrapperContext._COMM_CALLED.clear()
 
         model = models.model_without_pre_or_post_process[0]
         optimizer = optimizers.optimizer_without_pre_or_post_process
         torch.cuda.set_device(min(self.num_gpus_per_node - 1, 1))
         single_layer_optimizer_time = get_optimizer_time(
-                DistributedWrapperContext._COMM_CALLED,
                 model, optimizer)
-        for comms_to_measure in DistributedWrapperContext._COMM_CALLED.values():
-            for _, _, tensor_shape in comms_to_measure:
-                assert tensor_shape == [1]
-        DistributedWrapperContext._COMM_CALLED.clear()
 
         post_process_optimizer_time -= single_layer_optimizer_time
         pre_process_optimizer_time -= single_layer_optimizer_time
@@ -1010,18 +1048,10 @@ class Estimator:
         activation_shape = None
         activation_size = None
 
-        # Ignore small data loader/pmp communication
-        comm_logs = DistributedWrapperContext._COMM_CALLED
-        for comm_group, comms_to_measure in comm_logs.items():
-            for _, _, tensor_shape in comms_to_measure:
-                assert tensor_shape == [1]
-        DistributedWrapperContext._COMM_CALLED.clear()
-
         with context_handler():
             pre_process_forward_backward_time, \
                     activation_shape, _, pre_process_peak_memory, pre_process_comm_logs = \
                 do_forward_backward(self.num_gpus_per_node,
-                                    DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, pre_process=True)
             self._set_comm_logs(pre_process_comm_logs, pre_process=True)
@@ -1030,7 +1060,6 @@ class Estimator:
                     activation_shape, activation_size, single_layer_peak_memory, \
                     single_layer_comm_logs = \
                 do_forward_backward(self.num_gpus_per_node,
-                                    DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, input_tensor_shape=activation_shape)
             self._set_comm_logs(single_layer_comm_logs)
@@ -1038,7 +1067,6 @@ class Estimator:
             post_process_forward_backward_time, \
                     _, _, post_process_peak_memory, post_process_comm_logs = \
                 do_forward_backward(self.num_gpus_per_node,
-                                    DistributedWrapperContext._COMM_CALLED,
                                     self.forward_step_func, models, optimizers,
                                     train_data_iterator, post_process=True,
                                     input_tensor_shape=activation_shape)
