@@ -96,6 +96,11 @@ class CommHelper:
 
         self.comm_group = {}
         self.comm_cache = {}
+        self.comm_time_tensor = torch.FloatTensor([0.0])
+        if self.my_rank == 0:
+            self.tensor_list = [torch.FloatTensor([0.0])] * self.world_size
+        else:
+            self.tensor_list = None
 
     def request_comm(self, comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape):
         comm_rank_key = json.dumps(rank_to_comm_ranks, sort_keys=True)
@@ -136,6 +141,7 @@ class CommHelper:
             tensor_dtype, tensor_shape = decode_tensor_dtype_and_shape(self.tensor_shape_tensor)
 
             self._handle_comm(comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape)
+
         torch.distributed.barrier()
 
     def _get_comm_group(self, comm_ranks):
@@ -146,78 +152,81 @@ class CommHelper:
         return self.comm_group[key]
 
     def _handle_comm(self, comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape):
-        torch.cuda.set_device(self.local_rank)
-
         """Execute given communication and send the communication time to rank0"""
-        print(self.my_rank, comm_type, tensor_dtype, tensor_shape, rank_to_comm_ranks)
-        if self.my_rank == 0:
-            tensor_list = [torch.FloatTensor([0.0])] * self.world_size
-        else:
-            tensor_list = None
-
-        comm_time_tensor = torch.FloatTensor([0.0])
-        if tensor_dtype in [torch.int16, torch.int32, torch.int64]:
-            comm_tensor = torch.randint(low=0, high=100, size=tuple(tensor_shape)).cuda()
-        else:
-            comm_tensor = torch.randn(tensor_shape, dtype=tensor_dtype).cuda()
-        if comm_type == CommType.SEND_AND_RECV:
-            comm_tensor2 = comm_tensor.clone()
-
-        groups = {}
-        for rank in range(self.world_size):
-            if rank in rank_to_comm_ranks:
-                # group must be initialized across all ranks
-                group = self._get_comm_group(rank_to_comm_ranks[rank])
-                groups[rank] = group
-
+        torch.cuda.set_device(self.local_rank)
         torch.distributed.barrier()
         torch.cuda.synchronize()
-        if self.my_rank in rank_to_comm_ranks:
-            comm_ranks = rank_to_comm_ranks[self.my_rank]
-            group = groups[self.my_rank]
-            if len(comm_ranks) > 1:
-                comm_times = []
-                for i in range(NUM_AVERAGE + 1):
-                    if comm_type == CommType.BROADCAST:
-                        torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
-                    elif comm_type == CommType.ALLREDUCE:
-                        torch.distributed.all_reduce(comm_tensor, group=group)
-                    elif comm_type == CommType.SEND_OR_RECV:
-                        if self.my_rank == comm_ranks[0]:
-                            torch.distributed.send(comm_tensor, dst=comm_ranks[1], group=group)
-                        else:
-                            torch.distributed.recv(comm_tensor, src=comm_ranks[0], group=group)
-                    elif comm_type == CommType.SEND_AND_RECV:
-                        if self.my_rank == comm_ranks[0]:
-                            other_rank = comm_ranks[1]
-                        else:
-                            other_rank = comm_ranks[0]
-                        send_op = torch.distributed.P2POp(torch.distributed.isend,
-                                                          comm_tensor,
-                                                          other_rank,
-                                                          group=group)
-                        recv_op = torch.distributed.P2POp(torch.distributed.irecv,
-                                                          comm_tensor2,
-                                                          other_rank,
-                                                          group=group)
-                        reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
-                        for req in reqs:
-                            req.wait()
-                    else:
-                        raise NotImplementedError
+        try:
+            groups = {}
+            for rank in range(self.world_size):
+                if rank in rank_to_comm_ranks:
+                    # group must be initialized across all ranks
+                    group = self._get_comm_group(rank_to_comm_ranks[rank])
+                    groups[rank] = group
 
-                    s = time.time()
-                    torch.cuda.synchronize()
-                    if i > 0:
-                        comm_times.append(time.time() - s)
-                comm_time = sum(comm_times) / len(comm_times)
-                comm_time_tensor.data[0] = comm_time
+            if self.my_rank in rank_to_comm_ranks:
 
-        torch.distributed.gather(comm_time_tensor, tensor_list, dst=0)
+                if tensor_dtype in [torch.int16, torch.int32, torch.int64]:
+                    comm_tensor = torch.randint(low=0, high=100, size=tuple(tensor_shape)).cuda()
+                else:
+                    comm_tensor = torch.randn(tensor_shape, dtype=tensor_dtype).cuda()
+                if comm_type == CommType.SEND_AND_RECV:
+                    comm_tensor2 = comm_tensor.clone()
+
+                comm_ranks = rank_to_comm_ranks[self.my_rank]
+                group = groups[self.my_rank]
+                if len(comm_ranks) > 1:
+                    comm_times = []
+                    for i in range(NUM_AVERAGE + 1):
+                        if comm_type == CommType.BROADCAST:
+                            torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
+                        elif comm_type == CommType.ALLREDUCE:
+                            torch.distributed.all_reduce(comm_tensor, group=group)
+                        elif comm_type == CommType.SEND_OR_RECV:
+                            if self.my_rank == comm_ranks[0]:
+                                torch.distributed.send(comm_tensor, dst=comm_ranks[1], group=group)
+                            else:
+                                torch.distributed.recv(comm_tensor, src=comm_ranks[0], group=group)
+                        elif comm_type == CommType.SEND_AND_RECV:
+                            if self.my_rank == comm_ranks[0]:
+                                other_rank = comm_ranks[1]
+                            else:
+                                other_rank = comm_ranks[0]
+                            send_op = torch.distributed.P2POp(torch.distributed.isend,
+                                                              comm_tensor,
+                                                              other_rank,
+                                                              group=group)
+                            recv_op = torch.distributed.P2POp(torch.distributed.irecv,
+                                                              comm_tensor2,
+                                                              other_rank,
+                                                              group=group)
+                            reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
+                            for req in reqs:
+                                req.wait()
+                        else:
+                            raise NotImplementedError
+
+                        s = time.time()
+                        torch.cuda.synchronize()
+                        if i > 0:
+                            comm_times.append(time.time() - s)
+                    comm_time = sum(comm_times) / len(comm_times)
+                    self.comm_time_tensor.data[0] = comm_time
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                self.comm_time_tensor.data[0] = -1
+            else:
+                raise e
+
+        torch.distributed.gather(self.comm_time_tensor, self.tensor_list, dst=0)
         if self.my_rank != 0:
             return None
         comm_time_per_rank = defaultdict(int)
         for rank in range(self.world_size):
+            if self.tensor_list[rank] == -1:
+                self.terminate()
+                raise RuntimeError("out of memory")
+
             if rank in rank_to_comm_ranks:
-                comm_time_per_rank[rank] = tensor_list[rank].item()
+                comm_time_per_rank[rank] = self.tensor_list[rank].item()
         return comm_time_per_rank

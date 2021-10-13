@@ -1145,7 +1145,7 @@ class Estimator:
                     mp_forward_backward_times, pp_warmup_comm_time_per_stage,
                     pp_steady_comm_time_per_stage, pp_embedding_sync_time)
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
+            if "out of memory" in str(e):
                 tuner_logger.info(f"OOM for {config}")
                 return 0
             raise e

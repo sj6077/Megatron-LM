@@ -175,6 +175,7 @@ def get_actual_iter_time_and_memory(data_dir, model_config_str, dist_config_str,
 
     if is_oom:
         return 0, 0
+    del iter_time_ms[0] # optimizer initial time is included
     return max(iter_time_ms), max(mem_allocs)
 
 def estimator_run(data_dir, model, world_size, configs_to_test, env, queue):
