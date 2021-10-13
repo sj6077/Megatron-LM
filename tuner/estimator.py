@@ -336,7 +336,7 @@ def get_train_dataset(dataset='gpt'):
     if dataset != 'gpt':
         raise NotImplementedError
     args = get_args()
-    train_val_test_num_samples = [args.global_batch_size, 0, 0]
+    train_val_test_num_samples = [args.global_batch_size * (NUM_AVERAGE + 1), 0, 0]
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
         data_impl=args.data_impl,
@@ -356,9 +356,6 @@ def get_train_data_iterator(train_data_iterator):
 
 def get_forward_step_time(forward_step_func, train_data_iterator,
                           model, input_tensor, compute_loss = False):
-    unwrapped_model = unwrap_model(
-        model, (torchDDP, LocalDDP, Float16Module))
-    unwrapped_model.set_input_tensor(input_tensor)
     
     s = time.time()
     output, loss_func = forward_step_func(train_data_iterator, model)
@@ -437,6 +434,10 @@ def do_forward_backward(num_gpus_per_node, forward_step_func, models,
             torch.cuda.reset_max_memory_allocated()
             torch.cuda.reset_peak_memory_stats()
             DistributedWrapperContext.record_comm_logs()
+
+            unwrapped_model = unwrap_model(
+                model, (torchDDP, LocalDDP, Float16Module))
+            unwrapped_model.set_input_tensor(input_tensor)
 
         # do forward
         output, get_batch_time = get_forward_step_time(
