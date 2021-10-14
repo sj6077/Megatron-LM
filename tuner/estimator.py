@@ -763,6 +763,7 @@ class Estimator:
                 try:
                     comm_time = self.resp_queue.get(False)
                     print("received responce for", comm_type, tensor_dtype, tensor_shape, "as", comm_time)
+                    self.comm_cache[key] = comm_time
                     return comm_time
                 except Exception as e:
                     if self.event.is_set():

@@ -154,7 +154,6 @@ class CommHelper:
                 if comm_time_per_rank is None:
                     self.event.set()
                     break
-                self.comm_cache[key] = comm_time_per_rank
                 print("response queue put", comm_time_per_rank)
                 self.resp_queue.put(comm_time_per_rank)
             except Exception as e:
