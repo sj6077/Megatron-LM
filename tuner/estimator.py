@@ -8,7 +8,8 @@ import multiprocessing
 import os
 import sys
 import time
-from typing import Any, List, Union 
+from typing import Any, List, Union
+import queue
 
 import torch
 import torch.distributed as dist
@@ -386,6 +387,7 @@ def get_backward_step_time(optimizer, input_tensor,
     return input_tensor_grad
 
 def get_optimizer_time(model: torch.nn.Module, optimizer: MegatronOptimizer):
+    print("get_optimizer_time")
     for param in model.parameters():
         if param.requires_grad:
             if optimizer.params_have_main_grad:
@@ -400,6 +402,7 @@ def get_optimizer_time(model: torch.nn.Module, optimizer: MegatronOptimizer):
         optimizer.step()
     torch_cuda_synchronize()
     e = time.time()
+    optimizer.zero_grad()
     opt_time = (e - s) / NUM_AVERAGE
     return opt_time
 
@@ -655,10 +658,14 @@ def get_required_gpu_memory(param_sizes, grad_sizes, activation_size, peak_memor
     print("param_size", param_size, "peak_memory", peak_memory, "checkpoint_size", checkpoint_size, "grad_size", grad_size)
     return param_size + peak_memory + checkpoint_size + grad_size
 
-def run_comm_helper(env):
+def run_comm_helper(env, event, req_queue, resp_queue):
+    rank = int(env['RANK'])
     os.environ = env
-    comm_helper = CommHelper()
-    comm_helper.run_msg_handler()
+    comm_helper = CommHelper(event, req_queue, resp_queue)
+    if rank == 0:
+        comm_helper.run_msg_handler_for_rank0()
+    else:
+        comm_helper.run_msg_handler()
 
 class Estimator:
     def __init__(self, world_size, num_gpus_per_node, model_name='gpt'):
@@ -683,33 +690,44 @@ class Estimator:
         self.models = None
         self.optimizers = None
         self.embedding_shape = None
-        
-        node_rank = int(os.environ['NODE_RANK'])
-        procs = []
-        rank = node_rank * num_gpus_per_node
-        for local_rank in range(num_gpus_per_node):
-            print("handle for local rank", local_rank)
-            if rank == 0:
-                rank += 1
-                continue
-            ctx = multiprocessing.get_context('spawn')
-            env = os.environ.copy()
-            env['RANK'] = str(rank)
-            env['LOCAL_RANK'] = str(local_rank)
-            proc = ctx.Process(
-                    target=run_comm_helper,
-                    args=(env,))
-            procs.append(proc)
-            proc.start()
-            rank += 1
+        self.comm_helper_procs = []
+        self.event = None
+        self.req_queue = None
+        self.resp_queue = None
+        self.init_comm_helper_procs()
+        self.comm_cache = {}
 
-        if node_rank == 0:
-            os.environ['RANK'] = '0'
-            os.environ['LOCAL_RANK'] = '0'
-            self.comm_helper = CommHelper()
-        else:
-            for proc in procs:
+    def init_comm_helper_procs(self):
+        print("init_comm_helper_procs")
+        ctx = multiprocessing.get_context('spawn')
+        node_rank = int(os.environ['NODE_RANK'])
+        while True:
+            for proc in self.comm_helper_procs:
+                proc.terminate()
+            self.comm_helper_procs.clear()
+
+            self.event = ctx.Event()
+            self.req_queue = ctx.Queue() if node_rank == 0 else None
+            self.resp_queue = ctx.Queue() if node_rank == 0 else None
+            rank = node_rank * self.num_gpus_per_node
+            for local_rank in range(self.num_gpus_per_node):
+                env = os.environ.copy()
+                env['WORLD_SIZE'] = self.world_size
+                env['RANK'] = str(rank)
+                env['LOCAL_RANK'] = str(local_rank)
+                proc = ctx.Process(
+                        target=run_comm_helper,
+                        args=(env, self.event, self.req_queue, self.resp_queue))
+                self.comm_helper_procs.append(proc)
+                proc.start()
+                rank += 1
+
+            if node_rank == 0:
+                return
+            for proc in self.comm_helper_procs:
                 proc.join()
+                if proc.exception:
+                    print(f"node-{node_rank}", proc.exception)
 
     def __enter__(self):
         DistributedWrapperContext.patch_dist_func(self.world_size)
@@ -725,8 +743,32 @@ class Estimator:
 
     def __exit__(self, type, value, trace_back):
         DistributedWrapperContext.unpatch_dist_func()
-        self.comm_helper.terminate()
+        for proc in self.comm_helper_procs:
+            proc.terminate()
     
+    def request_comm(self, comm_type, comm_ranks, tensor_dtype, tensor_shape):
+        print("requst comm for", comm_type, tensor_dtype, tensor_shape)
+        assert os.environ['NODE_RANK'] == '0'
+        comm_rank_key = json.dumps(comm_ranks, sort_keys=True)
+        key = (comm_type, comm_rank_key, tensor_dtype, tuple(tensor_shape))
+        if key in self.comm_cache:
+            return self.comm_cache[key]
+
+        while True:
+            self.req_queue.put((comm_type, comm_ranks, tensor_dtype, tensor_shape))
+            print("request is pushed")
+
+            while True:
+                try:
+                    comm_time = self.resp_queue.get(False)
+                    print("received responce for", comm_type, tensor_dtype, tensor_shape, "as", comm_time)
+                    return comm_time
+                except Exception as e:
+                    if self.event.is_set():
+                        # assume all communication errors as oom error
+                        raise RuntimeError("out of memory")
+                    time.sleep(1)
+            
     def _get_models_and_optimizers(self):
         args = get_args()
         mp = args.tensor_model_parallel_size
@@ -813,6 +855,13 @@ class Estimator:
         self.grad_sizes[mp] = grad_sizes
 
     def _set_curr_task_to_rank(self, config):
+        if DistributedWrapperContext.CURR_CONFIG == config:
+            return
+
+        # initilaize communication helper processes to prevent oom error
+        # due to many communication group(too much of nccl buffer size)
+        self.init_comm_helper_procs()
+
         DistributedWrapperContext.CURR_CONFIG = config
         assert config.parallelism_order
         parallelism_order = config.parallelism_order.split(',')
@@ -877,7 +926,7 @@ class Estimator:
 
         for comm_type, tensor_dtype, tensor_shape in comm_logs:
             # the same time for the collective communication
-            single_comm_time_per_rank = self.comm_helper.request_comm(
+            single_comm_time_per_rank = self.request_comm(
                     comm_type, comm_ranks, tensor_dtype, tensor_shape)
             single_comm_time = 0
             for rank in comm_ranks:
@@ -966,7 +1015,7 @@ class Estimator:
                     dst_rank = stage_rank_list[stage]
                     recv_forward_rank_to_comm_ranks[src_rank] = [src_rank, dst_rank]
                     recv_forward_rank_to_comm_ranks[dst_rank] = [src_rank, dst_rank]
-                recv_forward = self.comm_helper.request_comm(
+                recv_forward = self.request_comm(
                         CommType.SEND_OR_RECV, recv_forward_rank_to_comm_ranks,
                         tensor_dtype, tensor_shape)[stage_rank]
             
@@ -980,19 +1029,19 @@ class Estimator:
                     dst_rank = stage_rank_list[stage]
                     recv_backward_rank_to_comm_ranks[src_rank] = [src_rank, dst_rank]
                     recv_backward_rank_to_comm_ranks[dst_rank] = [src_rank, dst_rank]
-                recv_backward = self.comm_helper.request_comm(
+                recv_backward = self.request_comm(
                         CommType.SEND_OR_RECV, recv_backward_rank_to_comm_ranks,
                         tensor_dtype, tensor_shape)[stage_rank]
             pp_warmup_comm_time_per_stage[stage] = recv_forward + recv_backward
 
             # steady: all_send_recv_ranks + send_recv_except_first_and_last_ranks
-            all_send_recv_time = self.comm_helper.request_comm(
+            all_send_recv_time = self.request_comm(
                     CommType.SEND_AND_RECV,
                     all_send_recv_ranks,
                     tensor_dtype, tensor_shape)[stage_rank]
             if stage != 0 and stage != pp - 1:
                 send_recv_except_first_and_last_time = \
-                        self.comm_helper.request_comm(
+                        self.request_comm(
                                 CommType.SEND_AND_RECV,
                                 send_recv_except_first_and_last_ranks,
                                 tensor_dtype, tensor_shape)[stage_rank]
@@ -1010,7 +1059,7 @@ class Estimator:
                 sync_embedding_rank_to_comm_ranks[stage_rank_list[-1]] = \
                         [stage_rank_list[0], stage_rank_list[-1]]
             embedding_shape = self.embedding_shape
-            pp_embedding_sync_time = self.comm_helper.request_comm(
+            pp_embedding_sync_time = self.request_comm(
                     CommType.ALLREDUCE,
                     sync_embedding_rank_to_comm_ranks,
                     torch.float16 if args.fp16 else torch.float32,
@@ -1176,7 +1225,7 @@ class Estimator:
 
             req_gpu_memory = get_required_gpu_memory(param_sizes, grad_sizes, activation_sizes, peak_memories)
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
+            if "out of memory" in str(e):
                 tuner_logger.info(f"OOM for {config}")
                 return 0
             raise e
