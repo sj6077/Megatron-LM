@@ -898,7 +898,8 @@ class Estimator:  # pylint: disable=too-many-instance-attributes
 
     def terminate(self):
         """Terminate estimator and communication helper processes"""
-        assert self.comm_helper_procs
+        if len(self.comm_helper_procs) == 0:
+            return
         if self.req_queue:
             self.req_queue.put((CommType.END, None, None, None))
         for proc in self.comm_helper_procs:
