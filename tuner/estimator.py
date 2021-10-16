@@ -1,16 +1,13 @@
-"""Tuning throught for given model and resources"""
+""" Tuning throught for given model and resources """
+# pylint: disable=too-many-lines, logging-fstring-interpolation
 from collections import defaultdict
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 import logging
-import math
 import multiprocessing
 import os
-import sys
 import json
 import time
-from typing import Any, List, Union
-import queue
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -21,19 +18,15 @@ from pretrain_gpt import model_provider as gpt_model_provider
 from pretrain_gpt import forward_step as gpt_forward_step
 
 from megatron import get_args
-from megatron import get_timers
-from megatron.arguments import parse_args
+from megatron import mpu
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.initialize import initialize_megatron
-import megatron.mpu as mpu
 from megatron.optimizer.optimizer import MegatronOptimizer
-from megatron.schedules import backward_step
 from megatron.training import cyclic_iter, setup_model_and_optimizer
 from megatron.utils import unwrap_model
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
-from megatron.model.language_model import Embedding
 
 from tuner.comm_helper import CommType, CommHelper
 
@@ -44,47 +37,57 @@ NUM_AVERAGE = 20
 
 @dataclass
 class Models:
+    """Single layer models including pre or post process"""
     model_with_pre_process: List[torch.nn.Module]
     model_without_pre_or_post_process: List[torch.nn.Module]
     model_with_post_process: List[torch.nn.Module]
 
 @dataclass
 class Optimizers:
+    """Single layer optimizers including pre or post process"""
     optimizer_with_pre_process: MegatronOptimizer
     optimizer_without_pre_or_post_process: MegatronOptimizer
     optimizer_with_post_process: MegatronOptimizer
 
+# pylint: disable=invalid-name
 @dataclass(frozen=True)
 class Task:
+    """Task identifier for 3D parallelism"""
     dp: int
     mp: int
     pp: int
 
 @dataclass
 class CommTime:
+    """Communication time for each parallelism"""
     dp: float = 0.0
     mp: float = 0.0
     pp: float = 0.0
 
 @dataclass
 class TimeOrMemory:
+    """Time or memory for single layer including pre or post process"""
     pre_process: float
     single_layer: float
     post_process: float
 
     def get_total(self, num_layers):
+        """Get total time or memory including both pre and post process"""
         return self.pre_process + self.single_layer * num_layers + self.post_process
 
     def get_max(self, num_layers):
+        """Get total time or memory including max value between pre or post process"""
         return max(self.pre_process, self.post_process) + self.single_layer * num_layers
 
 @dataclass
 class Log:
+    """Communication logs"""
     pre_process: list = field(default_factory=list)
     single_layer: list = field(default_factory=list)
     post_process: list = field(default_factory=list)
 
     def set(self, value, is_pre_process, is_post_process):
+        """Set the log value"""
         if is_pre_process:
             self.pre_process = value
         elif is_post_process:
@@ -92,15 +95,9 @@ class Log:
         else:
             self.single_layer = value
 
-@contextmanager
-def dummy_handler():
-    try:
-        yield
-    finally:
-        pass
-
 @dataclass(frozen=True)
 class Config:
+    """Configuration for parallelization method"""
     micro_batch_size: int
     global_batch_size: int
     dp: int = 1
@@ -108,6 +105,7 @@ class Config:
     pp: int = 1
 
 class DistributedWrapperContext:
+    """Mock torch distributed APIs"""
     _DEFAULT_INIT = dist.init_process_group
     _DEFAULT_IS_INIT = dist.is_initialized
     _DEFAULT_NEW_GROUP = dist.new_group
@@ -125,8 +123,10 @@ class DistributedWrapperContext:
     IS_MODEL_ENDED = False
     CURR_CONFIG = None
     START_TIME = None
-   
+
+    @staticmethod
     def record_comm_logs(after_forward_backward=False):
+        """Record communication logs for torch.distributed"""
         DistributedWrapperContext._START_RECORD_COMM = True
         if not after_forward_backward:
             DistributedWrapperContext.IS_MODEL_STARTED = False
@@ -135,7 +135,9 @@ class DistributedWrapperContext:
             DistributedWrapperContext.IS_MODEL_STARTED = True
             DistributedWrapperContext.IS_MODEL_ENDED = True
 
-    def new_group(*args, **kwargs):
+    @staticmethod
+    def new_group(*args, **kwargs): # pylint: disable=unused-argument
+        """Create dummy group"""
         ranks = args[0]
         assert ranks is not None
 
@@ -143,7 +145,9 @@ class DistributedWrapperContext:
         DistributedWrapperContext._DUMMY_GROUPS[group_name] = len(ranks)
         return group_name
 
+    @staticmethod
     def convert_group(group):
+        """Convert dummy group to the parallelization group"""
         assert group is not None
 
         if not group.startswith('dummy_group'):
@@ -163,7 +167,9 @@ class DistributedWrapperContext:
 
         return new_group
 
+    @staticmethod
     def get_world_size(world_size):
+        """Get world size according to the current configuration"""
         def _get_world_size(group=None):
             if group is None:
                 return world_size
@@ -172,20 +178,23 @@ class DistributedWrapperContext:
             if curr_config is None:
                 return DistributedWrapperContext._DUMMY_GROUPS[group]
 
-            if new_group ==  "model_parallel_group":
-                return curr_config.pp * curr_config.mp
+            if new_group == "model_parallel_group":
+                group_world_size = curr_config.pp * curr_config.mp
             elif new_group == "data_parallel_group":
-                return curr_config.dp
+                group_world_size = curr_config.dp
             elif new_group == "embedding_group":
-                return 0 if curr_config.pp == 1 else 2
+                group_world_size = 0 if curr_config.pp == 1 else 2
             elif new_group == "tensor_model_parallel_group":
-                return curr_config.mp
+                group_world_size = curr_config.mp
             else:
                 assert new_group == "pipeline_model_parallel_group"
-                return curr_config.pp
+                group_world_size = curr_config.pp
+            return group_world_size
         return _get_world_size
 
-    def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
+    @staticmethod
+    def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False): # pylint: disable=unused-argument
+        """Mock all_reduce"""
         if not DistributedWrapperContext._START_RECORD_COMM:
             return
 
@@ -200,7 +209,9 @@ class DistributedWrapperContext:
         comm_dict[comm_group].append((
             CommType.ALLREDUCE, tensor.dtype, list(tensor.size())))
 
-    def broadcast(tensor, src, group=None, async_op=False):
+    @staticmethod
+    def broadcast(tensor, src, group=None, async_op=False):  # pylint: disable=unused-argument
+        """Mock broadcast"""
         if not DistributedWrapperContext._START_RECORD_COMM:
             return
 
@@ -212,14 +223,17 @@ class DistributedWrapperContext:
             comm_dict = DistributedWrapperContext._WITHIN_MODEL
         comm_group = DistributedWrapperContext.convert_group(group)
         comm_dict[comm_group].append((
-                CommType.BROADCAST, tensor.dtype, list(tensor.size())))
+            CommType.BROADCAST, tensor.dtype, list(tensor.size())))
 
+    @staticmethod
     def get_comm_logs(pre_process=False, post_process=False, after_forward_backward=False):
+        """Get collected communication logs"""
         assert DistributedWrapperContext._START_RECORD_COMM
-        print(DistributedWrapperContext.CURR_CONFIG)
-        print("before model start comm logs", DistributedWrapperContext._BEFORE_MODEL_START)
-        print("within model comm logs", DistributedWrapperContext._WITHIN_MODEL)
-        print("after model end comm logs", DistributedWrapperContext._AFTER_MODEL_END)
+        tuner_logger.debug(f"curr_config: {DistributedWrapperContext.CURR_CONFIG}")
+        tuner_logger.debug(f"before model start comm logs: {DistributedWrapperContext._BEFORE_MODEL_START}")  # pylint: disable=line-too-long
+        tuner_logger.debug(f"within model comm logs: {DistributedWrapperContext._WITHIN_MODEL}")
+        tuner_logger.debug(f"after model end comm logs: {DistributedWrapperContext._AFTER_MODEL_END}")  # pylint: disable=line-too-long
+
         comm_logs = {}
         if after_forward_backward or post_process:
             comm_logs = DistributedWrapperContext._AFTER_MODEL_END.copy()
@@ -233,20 +247,25 @@ class DistributedWrapperContext:
         DistributedWrapperContext.reset_comm_logs()
         return comm_logs
 
-    def reset_comm_logs():
+    @staticmethod
+    def reset_comm_logs():  # pylint: disable=no-method-argument
+        """Clear all collected communication logs"""
         DistributedWrapperContext._BEFORE_MODEL_START.clear()
         DistributedWrapperContext._AFTER_MODEL_END.clear()
         DistributedWrapperContext._WITHIN_MODEL.clear()
 
         DistributedWrapperContext._START_RECORD_COMM = False
 
+    @staticmethod
     def dummy_func_with_return(return_value=None):
-        def dummy_func(*args, **kwargs):
+        """dummy function that has a fixed return value"""
+        def dummy_func(*args, **kwargs):  # pylint:disable=unused-argument
             return return_value
         return dummy_func
 
     @staticmethod
     def patch_dist_func(world_size):
+        """Mock torch.distributed APIs"""
         setattr(dist, 'init_process_group', DistributedWrapperContext.dummy_func_with_return())
         setattr(dist, 'is_initialized', DistributedWrapperContext.dummy_func_with_return(True))
         setattr(dist, 'new_group', DistributedWrapperContext.new_group)
@@ -259,6 +278,7 @@ class DistributedWrapperContext:
 
     @staticmethod
     def unpatch_dist_func():
+        """Revert torch.distributed APIs to orignal functions"""
         setattr(dist, 'init_process_group', DistributedWrapperContext._DEFAULT_INIT)
         setattr(dist, 'is_initialized', DistributedWrapperContext._DEFAULT_IS_INIT)
         setattr(dist, 'new_group', DistributedWrapperContext._DEFAULT_NEW_GROUP)
@@ -269,82 +289,76 @@ class DistributedWrapperContext:
         setattr(dist, 'broadcast', DistributedWrapperContext._DEFAULT_BROADCAST)
         setattr(torch.cuda, 'synchronize', torch_cuda_synchronize)
 
-def forward_hook(module, input):
+def forward_hook(module, forward_input):  # pylint: disable=unused-argument
+    """Set model forward is started"""
     DistributedWrapperContext.IS_MODEL_STARTED = True
     DistributedWrapperContext.START_TIME = time.time()
 
-def backward_hook(module, grad_input, grad_output):
-    DistributedWrapperContext.IS_MODEL_ENDED = True 
+def backward_hook(module, grad_input, grad_output):  # pylint: disable=unused-argument
+    """Set model backward is ended"""
+    DistributedWrapperContext.IS_MODEL_ENDED = True
 
 def get_post_process_device(num_gpus_per_node):
+    """Get device for single layer model including post process"""
     if num_gpus_per_node > 2:
         return 2
-    else:
-        return 0
+    return 0
 
 def get_single_layer_device(num_gpus_per_node):
+    """Get device for single layer model"""
     if num_gpus_per_node == 1:
         return 0
-    elif num_gpus_per_node > 1:
-        return 1
+    return 1
 
-def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None):
-    print("get_single_layer_model", num_gpus_per_node)
+# pylint: disable=too-many-locals
+def get_single_layer_model(model_provider, num_gpus_per_node):
+    """Create models and optimizers for pre+single_layer, single_layer, and post+single_layer"""
+    tuner_logger.debug(f"get_single_layer_model for num_gpus_per_node: {num_gpus_per_node}")
 
     args = get_args()
-    # disable save and load checkpoints
-    args.load = None
-    args.save = None
 
     pre_process_device = 0
     torch.cuda.set_device(pre_process_device)
-    def model_provider_with_pre_process(pre_process=True, post_process=True):
+    def model_provider_with_pre_process(pre_process=True, post_process=True):  # pylint: disable=unused-argument
         new_model = model_provider(pre_process=True, post_process=False)
         return new_model
     model_with_pre_process, optimizer_with_pre_process, _ = setup_model_and_optimizer(
-            model_provider_with_pre_process)
+        model_provider_with_pre_process)
     model_with_pre_process[0].register_forward_pre_hook(forward_hook)
     model_with_pre_process[0].register_backward_hook(backward_hook)
     unwrapped_model_with_pre_process = unwrap_model(
-            model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0]
+        model_with_pre_process, (torchDDP, LocalDDP, Float16Module))[0]
     embedding = unwrapped_model_with_pre_process.language_model.embedding
 
     single_layer_device = get_single_layer_device(num_gpus_per_node)
     torch.cuda.set_device(single_layer_device)
     # Get single transformer layer model
     assert args.num_layers == args.pipeline_model_parallel_size == 1
-    def model_provider_without_pre_or_post_process(pre_process=True, post_process=True):
+    def model_provider_without_pre_or_post_process(pre_process=True, post_process=True):  # pylint: disable=unused-argument
         return model_provider(pre_process=False, post_process=False)
     model, optimizer, _ = setup_model_and_optimizer(
-            model_provider_without_pre_or_post_process)
+        model_provider_without_pre_or_post_process)
     model[0].register_forward_pre_hook(forward_hook)
     model[0].register_backward_hook(backward_hook)
 
     post_process_device = get_post_process_device(num_gpus_per_node)
     torch.cuda.set_device(post_process_device)
-    print("pre_process_device", pre_process_device, "post_process_device", post_process_device)
     if pre_process_device != post_process_device:
         tmp_pre_process_model = model_provider(pre_process=True, post_process=False)
         embedding = tmp_pre_process_model.language_model.embedding
-        print("embedding device", embedding.word_embeddings.weight.get_device())
         del tmp_pre_process_model
-    def model_provider_with_post_process(pre_process=True, post_process=True):
+    def model_provider_with_post_process(pre_process=True, post_process=True): # pylint: disable=unused-argument
         new_model = model_provider(pre_process=False, post_process=True)
         return new_model
     model_with_post_process, optimizer_with_post_process, _ = setup_model_and_optimizer(
-            model_provider_with_post_process)
+        model_provider_with_post_process)
     model_with_post_process[0].register_forward_pre_hook(forward_hook)
     model_with_post_process[0].register_backward_hook(backward_hook)
     # embedding set after optimizer is created so that the embedding is excluded from the optimizer
     unwrapped_model_with_post_process = unwrap_model(
-            model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0]
+        model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0]
     unwrapped_model_with_post_process.language_model.embedding = \
             embedding
-    assert unwrapped_model_with_post_process.language_model.embedding.word_embeddings.weight.get_device() == embedding.word_embeddings.weight.get_device(), (unwrapped_model_with_post_process.language_model.embedding.word_embeddings.weight.get_device(), embedding.word_embeddings.weight.get_device())
-    print("embedding device", embedding.word_embeddings.weight.get_device())
-    unwrapped_model_with_post_process2 = unwrap_model(
-            model_with_post_process, (torchDDP, LocalDDP, Float16Module))[0]
-    assert unwrapped_model_with_post_process.language_model.embedding == unwrapped_model_with_post_process2.language_model.embedding
 
     models = Models(model_with_pre_process=model_with_pre_process,
                     model_without_pre_or_post_process=model,
@@ -357,11 +371,12 @@ def get_single_layer_model(model_provider, num_gpus_per_node, args_defaults=None
     return models, optimizers, embedding.word_embeddings.weight.size()
 
 def get_train_dataset(dataset='gpt'):
+    """Create dataset for training"""
     if dataset != 'gpt':
         raise NotImplementedError
     args = get_args()
     train_val_test_num_samples = [args.global_batch_size * (NUM_AVERAGE + 1), 0, 0]
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+    train_ds, _, _ = build_train_valid_test_datasets(
         data_prefix=args.data_path,
         data_impl=args.data_impl,
         splits_string=args.split,
@@ -372,27 +387,27 @@ def get_train_dataset(dataset='gpt'):
     return train_ds
 
 def get_train_data_iterator(train_data_iterator):
-    args = get_args()
+    """Create train data iterator for the current micro batch size"""
     train_dataloader = build_pretraining_data_loader(
-            train_data_iterator, 0)
+        train_data_iterator, 0)
     train_data_iterator = iter(cyclic_iter(train_dataloader))
     return train_data_iterator
 
 def get_forward_step_time(forward_step_func, train_data_iterator,
-                          model, input_tensor, compute_loss = False):
-    
+                          model, compute_loss=False):
+    """Get single layer forward step time"""
     s = time.time()
     output, loss_func = forward_step_func(train_data_iterator, model)
     if compute_loss:
         output = loss_func(output)
-        loss, loss_reduced = output
+        loss, _ = output
         output = loss
 
     return output, DistributedWrapperContext.START_TIME - s
 
 def get_backward_step_time(optimizer, input_tensor,
                            output_tensor, output_tensor_grad):
-    args = get_args()
+    """Get single layer backward step time"""
 
     # Retain the grad on the input_tensor.
     if input_tensor is not None:
@@ -410,7 +425,8 @@ def get_backward_step_time(optimizer, input_tensor,
     return input_tensor_grad
 
 def get_optimizer_time(model: torch.nn.Module, optimizer: MegatronOptimizer):
-    print("get_optimizer_time")
+    """Get single layer optimizer time"""
+    tuner_logger.debug("get_optimizer_time")
     for param in model.parameters():
         if param.requires_grad:
             if optimizer.params_have_main_grad:
@@ -428,23 +444,23 @@ def get_optimizer_time(model: torch.nn.Module, optimizer: MegatronOptimizer):
 
     # do allreduce gradients
     DistributedWrapperContext.record_comm_logs(after_forward_backward=True)
-    print("start allreduce gradients")
+    tuner_logger.debug("start allreduce gradients")
     model.allreduce_gradients()
     torch_cuda_synchronize()
-    print("finish allreduce gradients")
+    tuner_logger.debug("finish allreduce gradients")
     dp_comm_logs = DistributedWrapperContext.get_comm_logs(after_forward_backward=True)
     DistributedWrapperContext.reset_comm_logs()
     optimizer.zero_grad()
     opt_time = (e - s) / NUM_AVERAGE
-    print("finish get_optimizer_time", opt_time, dp_comm_logs)
+    tuner_logger.debug(f"finish get_optimizer_time: {opt_time}, {dp_comm_logs}")
     return opt_time, dp_comm_logs
 
-def do_forward_backward(num_gpus_per_node, forward_step_func, models,
+def do_forward_backward(num_gpus_per_node, forward_step_func, models,  # pylint: disable=too-many-arguments
                         optimizers, train_data_iterator,
                         pre_process=False, post_process=False,
                         input_tensor_shape=None):
-
-    print("run model start", pre_process, post_process)
+    """Execute forward and backward computation for a single layer"""
+    tuner_logger.debug(f"run model start pre - {pre_process}, post - {post_process}")
     if pre_process:
         torch.cuda.set_device(0)
         input_tensor = None
@@ -474,16 +490,13 @@ def do_forward_backward(num_gpus_per_node, forward_step_func, models,
             unwrapped_model = unwrap_model(
                 model, (torchDDP, LocalDDP, Float16Module))
             unwrapped_model.set_input_tensor(input_tensor)
-            if post_process:
-                print("do forward backward", input_tensor.get_device(), unwrapped_model.language_model.embedding.word_embeddings.weight.get_device())
 
         # do forward
         output, get_batch_time = get_forward_step_time(
-                forward_step_func,
-                train_data_iterator,
-                model,
-                input_tensor,
-                compute_loss=post_process)
+            forward_step_func,
+            train_data_iterator,
+            model,
+            compute_loss=post_process)
         if i == 0:
             activation_shape = output.size()
             activation_size = output.nelement() * output.element_size()
@@ -496,15 +509,14 @@ def do_forward_backward(num_gpus_per_node, forward_step_func, models,
                 output_tensor_grad.requires_grad = True
 
         get_backward_step_time(
-                optimizer,
-                input_tensor,
-                output,
-                output_tensor_grad)
+            optimizer,
+            input_tensor,
+            output,
+            output_tensor_grad)
 
         if i == 0:
-            forward_backward_comm_logs = \
-                    DistributedWrapperContext.get_comm_logs(
-                    pre_process, post_process)
+            forward_backward_comm_logs = DistributedWrapperContext.get_comm_logs(
+                pre_process, post_process)
 
             torch_cuda_synchronize()
             peak_memory = torch.cuda.max_memory_allocated() - torch.cuda.memory_allocated()
@@ -515,9 +527,10 @@ def do_forward_backward(num_gpus_per_node, forward_step_func, models,
     if not pre_process:
         e -= get_batch_time
     forward_backward_time = (e - s) / NUM_AVERAGE
-    return forward_backward_time, activation_shape, activation_size, peak_memory, forward_backward_comm_logs
+    return forward_backward_time, activation_shape, activation_size, \
+            peak_memory, forward_backward_comm_logs
 
-def get_iter_time_estimation(forward_backward_times,
+def get_iter_time_estimation(forward_backward_times,  # pylint: disable=too-many-arguments, too-many-statements
                              optimizer_times,
                              mp_comm_times,
                              pp_warmup_comm_time_per_stage,
@@ -525,13 +538,13 @@ def get_iter_time_estimation(forward_backward_times,
                              pp_embedding_sync_time,
                              dp_comm_times):
     """Get iter time estimation as milliseconds"""
-    print("forward_backward_times", forward_backward_times)
-    print("optimizer_times", optimizer_times)
-    print("mp_comm_times", mp_comm_times)
-    print("pp_warmup_comm_time_per_stage", pp_warmup_comm_time_per_stage)
-    print("pp_steady_comm_time_per_stage", pp_steady_comm_time_per_stage)
-    print("pp_embedding_sync_time", pp_embedding_sync_time)
-    print("dp_comm_times", dp_comm_times)
+    tuner_logger.debug(f"forward_backward_times: {forward_backward_times}")
+    tuner_logger.debug(f"optimizer_times: {optimizer_times}")
+    tuner_logger.debug(f"mp_comm_times: {mp_comm_times}")
+    tuner_logger.debug(f"pp_warmup_comm_time_per_stage: {pp_warmup_comm_time_per_stage}")
+    tuner_logger.debug(f"pp_steady_comm_time_per_stage: {pp_steady_comm_time_per_stage}")
+    tuner_logger.debug(f"pp_embedding_sync_time: {pp_embedding_sync_time}")
+    tuner_logger.debug(f"dp_comm_times: {dp_comm_times}")
 
     args = get_args()
     num_layers = args.num_layers
@@ -548,13 +561,13 @@ def get_iter_time_estimation(forward_backward_times,
     warmup_time = warmup_kernel_forward_backward_time + \
             warmup_mp_comm_time + \
             warmup_pp_time
-    print("warmup_kernel_forward_backward_time", warmup_kernel_forward_backward_time,
-          "warmup_mp_comm_time", warmup_mp_comm_time,
-          "warmup_pp_time", warmup_pp_time,
-          "warmup_time", warmup_time)
+    log = f"warmup_kernel_forward_backward_time: {warmup_kernel_forward_backward_time}, " \
+          f"warmup_mp_comm_time: {warmup_mp_comm_time}, " \
+          f"warmup_pp_comm_time: {warmup_pp_time}, " \
+          f"warmup_time: {warmup_time}"
+    tuner_logger.debug(log)
 
     if args.pipeline_model_parallel_size == 1:
-        print("hello")
         stage_time = warmup_time
         mp_stage_time = warmup_mp_comm_time
         pp_stage_time = warmup_pp_time
@@ -586,7 +599,6 @@ def get_iter_time_estimation(forward_backward_times,
             stage_time = max(stage_time, curr_stage_time)
             mp_stage_time = max(mp_stage_time, curr_mp_stage_time)
             pp_stage_time = max(pp_stage_time, curr_pp_stage_time)
-            print(f"stage time of {stage}: {curr_stage_time}")
         stage_time *= 1000
         mp_stage_time *= 1000
         pp_stage_time *= 1000
@@ -601,12 +613,16 @@ def get_iter_time_estimation(forward_backward_times,
     mp_time = warmup_mp_comm_time + mp_stage_time * (num_micro_batches - 1)
     pp_time = warmup_pp_time + pp_stage_time * (num_micro_batches - 1)
     dp_time = dp_comm_time
-    print(f"warmup_time - {warmup_time}, stage_time - {stage_time * (num_micro_batches - 1)}")
-    print(f"optimizer_time - {stage_optimizer_time}, embedding_sync_time - {pp_embedding_sync_time}")
-    print(f"iter_time - {iter_time}")
+
+    tuner_logger.info(f"iter_time - {iter_time}")
+    log = f"mp_time - {mp_time}, pp_time - {pp_time}, dp_time - {dp_time}, " \
+          f"pp_embedding_sync_time - {pp_embedding_sync_time}," \
+          f"optimizer_time - {stage_optimizer_time}"
+    tuner_logger.info(log)
     return iter_time, mp_time, pp_time, dp_time
 
 def tensor_nested_iterator(item):
+    """Iterate module's state_dict to find all leaf tensors"""
     if isinstance(item, dict):
         for value in item.values():
             for val in tensor_nested_iterator(value):
@@ -619,6 +635,7 @@ def tensor_nested_iterator(item):
         yield item
 
 def get_unique_param_size(params_list):
+    """Get the sum of all the unique parameter sizes as bytes"""
     param_size = 0
     param_ids = set()
     for params in params_list:
@@ -633,16 +650,18 @@ def get_unique_param_size(params_list):
 
 def get_param_and_grad_sizes(models: Models, optimizers: Optimizers):
     """Get parameter size for pre_process, single_layer, post_process as bytes"""
-    
+
     with_pre_process_param_size = get_unique_param_size(
-        [tensor_nested_iterator(optimizers.optimizer_with_pre_process.state_dict()),  # optimizer states (32 bit)
-        optimizers.optimizer_with_pre_process.get_parameters(),  # optimizer params (32 bit)
-        models.model_with_pre_process[0].parameters()])  # model params (32 bit or 16bit)
+        [tensor_nested_iterator(
+            optimizers.optimizer_with_pre_process.state_dict()),  # optimizer states (32 bit)
+         optimizers.optimizer_with_pre_process.get_parameters(),  # optimizer params (32 bit)
+         models.model_with_pre_process[0].parameters()])  # model params (32 bit or 16bit)
 
     without_pre_or_post_process_param_size = get_unique_param_size(
-        [tensor_nested_iterator(optimizers.optimizer_without_pre_or_post_process.state_dict()),
-        optimizers.optimizer_without_pre_or_post_process.get_parameters(),
-        models.model_without_pre_or_post_process[0].parameters()])
+        [tensor_nested_iterator(
+            optimizers.optimizer_without_pre_or_post_process.state_dict()),
+         optimizers.optimizer_without_pre_or_post_process.get_parameters(),
+         models.model_without_pre_or_post_process[0].parameters()])
 
     # exclude embedding params from post_process
     unwrapped_model_with_post_process = unwrap_model(
@@ -650,9 +669,10 @@ def get_param_and_grad_sizes(models: Models, optimizers: Optimizers):
     orig_embedding = unwrapped_model_with_post_process.embedding
     unwrapped_model_with_post_process.embedding = None
     with_post_process_param_size = get_unique_param_size(
-        [tensor_nested_iterator(optimizers.optimizer_with_post_process.state_dict()),
-        optimizers.optimizer_with_post_process.get_parameters(),
-        models.model_with_post_process[0].parameters()])
+        [tensor_nested_iterator(
+            optimizers.optimizer_with_post_process.state_dict()),
+         optimizers.optimizer_with_post_process.get_parameters(),
+         models.model_with_post_process[0].parameters()])
     unwrapped_model_with_post_process.embedding = orig_embedding
 
     with_pre_process_param_size -= without_pre_or_post_process_param_size
@@ -662,11 +682,11 @@ def get_param_and_grad_sizes(models: Models, optimizers: Optimizers):
                                with_post_process_param_size)
 
     with_pre_process_grad_size = get_unique_param_size(
-            [optimizers.optimizer_with_pre_process.get_parameters()])
+        [optimizers.optimizer_with_pre_process.get_parameters()])
     without_pre_or_post_process_grad_size = get_unique_param_size(
-            [optimizers.optimizer_without_pre_or_post_process.get_parameters()])
+        [optimizers.optimizer_without_pre_or_post_process.get_parameters()])
     with_post_process_grad_size = get_unique_param_size(
-            [optimizers.optimizer_with_post_process.get_parameters()])
+        [optimizers.optimizer_with_post_process.get_parameters()])
     with_pre_process_grad_size -= without_pre_or_post_process_grad_size
     with_post_process_grad_size -= without_pre_or_post_process_grad_size
     grad_sizes = TimeOrMemory(with_pre_process_grad_size,
@@ -682,15 +702,19 @@ def get_param_and_grad_sizes(models: Models, optimizers: Optimizers):
     return param_sizes, grad_sizes
 
 def get_required_gpu_memory(param_sizes, grad_sizes, activation_size, peak_memories):
+    """Get required gpu memory to execute a model"""
     args = get_args()
     num_layers = args.num_layers
     num_micro_batches = args.global_batch_size // args.micro_batch_size // args.data_parallel_size
     pp = args.pipeline_model_parallel_size
     num_layers_per_stage = num_layers / pp
     assert args.activations_checkpoint_method == 'uniform'
-    
-    peak_memory = max(peak_memories.pre_process, peak_memories.single_layer, peak_memories.post_process) / 1024 / 1024
-    checkpoint_size = (activation_size * (num_layers_per_stage // args.activations_checkpoint_num_layers - 1)) / 1024 / 1024
+    peak_memory = max(peak_memories.pre_process,
+                      peak_memories.single_layer,
+                      peak_memories.post_process)
+    peak_memory /= 1024 * 1024
+    num_checkpoint_layers = num_layers_per_stage / args.activations_checkpoint_num_layers
+    checkpoint_size = (activation_size * (num_checkpoint_layers - 1)) / 1024 / 1024
     if pp == 1:
         param_size = param_sizes.get_total(num_layers) / 1024 / 1024
     else:
@@ -702,16 +726,84 @@ def get_required_gpu_memory(param_sizes, grad_sizes, activation_size, peak_memor
         else:
             grad_size = grad_sizes.get_max(num_layers_per_stage) / 1024 / 1024
     else:
-        grad_size = max(0, grad_sizes.single_layer - activation_size / args.activations_checkpoint_num_layers)
+        checkpoint_size_per_single_layer = activation_size / args.activations_checkpoint_num_layers
+        grad_size = max(0, grad_sizes.single_layer - checkpoint_size_per_single_layer)
         grad_size *= num_layers_per_stage / 1024 / 1024
         if pp == 1:
             grad_size += (grad_sizes.pre_process + grad_sizes.post_process) / 1024 / 1024
         else:
-            grad_size += max(grad_sizes.pre_process, grad_sizes.post_process) / 1024 / 1024 
-    print("param_size", param_size, "peak_memory", peak_memory, "checkpoint_size", checkpoint_size, "grad_size", grad_size)
+            grad_size += max(grad_sizes.pre_process, grad_sizes.post_process) / 1024 / 1024
+    log = f"param_size - {param_size}, peak_memory - {peak_memory}, " \
+          f"checkpoint_size - {checkpoint_size}, grad_size - {grad_size}"
+    tuner_logger.info(log)
     return param_size + peak_memory + checkpoint_size + grad_size
 
+
+def get_p2p_ranks_from_prev_stage(stage, stage_ranks):
+    """Get p2p communication ranks for the given stage when
+       the stage receives data from the previous stage.
+    """
+    p2p_ranks_from_prev_stage = {}
+    for stage_rank_list in stage_ranks.values():
+        src_rank = stage_rank_list[stage - 1]
+        dst_rank = stage_rank_list[stage]
+        p2p_ranks_from_prev_stage[src_rank] = [src_rank, dst_rank]
+        p2p_ranks_from_prev_stage[dst_rank] = [src_rank, dst_rank]
+    return p2p_ranks_from_prev_stage
+
+def get_p2p_ranks_from_next_stage(stage, stage_ranks):
+    """Get p2p communication ranks for the given stage when
+       the stage receives data from the next stage.
+    """
+    p2p_ranks_from_next_stage = {}
+    for stage_rank_list in stage_ranks.values():
+        src_rank = stage_rank_list[stage + 1]
+        dst_rank = stage_rank_list[stage]
+        p2p_ranks_from_next_stage[src_rank] = [src_rank, dst_rank]
+        p2p_ranks_from_next_stage[dst_rank] = [src_rank, dst_rank]
+    return p2p_ranks_from_next_stage
+
+def get_p2p_ranks_for_embedding_sync(stage_ranks):
+    """P2P ranks for embedding sync for each (mp, dp)"""
+    p2p_ranks_for_embedding_sync = {}
+    for stage_rank_list in stage_ranks.values():
+        p2p_ranks_for_embedding_sync[stage_rank_list[0]] = \
+                [stage_rank_list[0], stage_rank_list[-1]]
+        p2p_ranks_for_embedding_sync[stage_rank_list[-1]] = \
+                [stage_rank_list[0], stage_rank_list[-1]]
+    return p2p_ranks_for_embedding_sync
+
+def get_p2p_ranks_for_all(stage_ranks, task_to_rank):
+    """Get communication ranks when all gpus communicate with prev or next"""
+    all_send_recv_ranks = {}
+    for task, rank in task_to_rank.items():
+        key = (task.mp, task.dp)
+        if task.pp % 2 == 0:
+            all_send_recv_ranks[rank] = [rank, stage_ranks[key][task.pp + 1]]
+        else:
+            all_send_recv_ranks[rank] = [stage_ranks[key][task.pp - 1], rank]
+    return all_send_recv_ranks
+
+def get_p2p_ranks_except_first_and_last_stage(stage_ranks, task_to_rank, pp):
+    """Get communication ranks when all gpus communicate with prev or next
+       except the first and the last stage"""
+
+    send_recv_except_first_and_last_ranks = {}
+    for task, rank in task_to_rank.items():
+        key = (task.mp, task.dp)
+        stage = task.pp
+        if task.pp % 2 == 0:
+            if stage != 0:
+                send_recv_except_first_and_last_ranks[rank] = \
+                        [stage_ranks[key][task.pp - 1], rank]
+        else:
+            if stage != pp - 1:
+                send_recv_except_first_and_last_ranks[rank] = \
+                        [rank, stage_ranks[key][task.pp + 1]]
+    return send_recv_except_first_and_last_ranks
+
 def run_comm_helper(env, event, req_queue, resp_queue):
+    """Run communication helper for each GPU"""
     rank = int(env['RANK'])
     os.environ = env
     comm_helper = CommHelper(event, req_queue, resp_queue)
@@ -720,7 +812,10 @@ def run_comm_helper(env, event, req_queue, resp_queue):
     else:
         comm_helper.run_msg_handler()
 
-class Estimator:
+class Estimator:  # pylint: disable=too-many-instance-attributes
+    """Estimator for a model's iteration time and gpu memory requirements
+       for different parallelization methods as represented as configs.
+    """
     def __init__(self, world_size, num_gpus_per_node, model_name='gpt'):
         self.world_size = world_size
         self.num_gpus_per_node = num_gpus_per_node
@@ -753,9 +848,9 @@ class Estimator:
 
         DistributedWrapperContext.patch_dist_func(1)
         if self.model_name == 'gpt':
-            # initialize as single gpu at first
+            # initialize as single gpu at the first
             os.environ['WORLD_SIZE'] = '1'
-            args_defaults = args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
+            args_defaults = args_defaults = {'tokenizer_type': 'GPT2BPETokenizer'}
             initialize_megatron(args_defaults=args_defaults)
             self.train_ds = get_train_dataset(dataset='gpt')
             self.forward_step_func = gpt_forward_step
@@ -763,11 +858,15 @@ class Estimator:
         else:
             raise NotImplementedError
         DistributedWrapperContext.patch_dist_func(self.world_size)
-        args = get_args()
         self.curr_config = None
 
     def init_comm_helper_procs(self):
-        print("init_comm_helper_procs")
+        """Initialize communication helper processes for this machine.
+           Non-master process(node_rank!=0) just executes communication helper until
+           the job is terminated.
+           Master process(node_rank==0) reset communication helper processes
+        """
+        tuner_logger.debug("init_comm_helper_procs")
         ctx = multiprocessing.get_context('spawn')
         node_rank = int(os.environ['NODE_RANK'])
         while True:
@@ -785,8 +884,8 @@ class Estimator:
                 env['RANK'] = str(rank)
                 env['LOCAL_RANK'] = str(local_rank)
                 proc = ctx.Process(
-                        target=run_comm_helper,
-                        args=(env, self.event, self.req_queue, self.resp_queue))
+                    target=run_comm_helper,
+                    args=(env, self.event, self.req_queue, self.resp_queue))
                 self.comm_helper_procs.append(proc)
                 proc.start()
                 rank += 1
@@ -799,13 +898,14 @@ class Estimator:
                 proc.join()
 
     def terminate(self):
+        """Terminate estimator and communication helper processes"""
         assert self.comm_helper_procs
         self.req_queue.put((CommType.END, None, None, None))
         for proc in self.comm_helper_procs:
             proc.join()
 
     def request_comm(self, comm_type, comm_ranks, tensor_dtype, tensor_shape):
-        print("requst comm for", comm_type, tensor_dtype, tensor_shape)
+        """Get communication time by requesting communication to communication helpers"""
         assert os.environ['NODE_RANK'] == '0'
         comm_rank_key = json.dumps(comm_ranks, sort_keys=True)
         key = (comm_type, comm_rank_key, tensor_dtype, tuple(tensor_shape))
@@ -814,62 +914,57 @@ class Estimator:
 
         while True:
             self.req_queue.put((comm_type, comm_ranks, tensor_dtype, tensor_shape))
-            print("request is pushed")
 
             while True:
                 try:
                     comm_time = self.resp_queue.get(False)
-                    print("received responce for", comm_type, tensor_dtype, tensor_shape, "as", comm_time)
                     self.comm_cache[key] = comm_time
                     return comm_time
-                except Exception as e:
+                except Exception:  # pylint: disable=broad-except
                     if self.event.is_set():
                         # assume all communication errors as oom error
-                        raise RuntimeError("out of memory")
+                        raise RuntimeError("out of memory")  # pylint: disable=raise-missing-from
                     time.sleep(1)
-            
+
     def _get_models_and_optimizers(self):
         args = get_args()
         mp = args.tensor_model_parallel_size
         if mp == self.curr_mp:
             return self.models, self.optimizers
         dp = args.data_parallel_size
-        
-        # TODO(SJ): handle oom for the large model
-        if self.model_name == 'gpt':
-            if self.curr_mp:
-                del self.models
-                del self.optimizers
-            torch.cuda.empty_cache()
-            os.environ['WORLD_SIZE'] = str(mp * dp)
 
-            # set pp1 and num_layers1 to get single layer model
-            original_pp = args.pipeline_model_parallel_size
-            original_layers = args.num_layers
-            original_config = DistributedWrapperContext.CURR_CONFIG
-            assert original_pp == original_config.pp
-            new_config = Config(global_batch_size=original_config.global_batch_size,
-                                micro_batch_size=original_config.micro_batch_size,
-                                pp=1,
-                                mp=original_config.mp,
-                                dp=original_config.dp)
-            DistributedWrapperContext.CURR_CONFIG = new_config
-            args.num_layers = 1
-            args.pipeline_model_parallel_size = 1
-
-            self.models, self.optimizers, self.embedding_shape = \
-                    get_single_layer_model(
-                    gpt_model_provider,
-                    self.num_gpus_per_node,
-                    args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
-
-            args.pipeline_model_parallel_size = original_pp
-            args.num_layers = original_layers
-            DistributedWrapperContext.CURR_CONFIG = original_config
-            self.curr_mp = mp
-            return self.models, self.optimizers
-        else:
+        if self.model_name != 'gpt':
             raise NotImplementedError
+
+        if self.curr_mp:
+            del self.models
+            del self.optimizers
+        torch.cuda.empty_cache()
+        os.environ['WORLD_SIZE'] = str(mp * dp)
+
+        # set pp1 and num_layers1 to get single layer model
+        original_pp = args.pipeline_model_parallel_size
+        original_layers = args.num_layers
+        original_config = DistributedWrapperContext.CURR_CONFIG
+        assert original_pp == original_config.pp
+        new_config = Config(global_batch_size=original_config.global_batch_size,
+                            micro_batch_size=original_config.micro_batch_size,
+                            pp=1,
+                            mp=original_config.mp,
+                            dp=original_config.dp)
+        DistributedWrapperContext.CURR_CONFIG = new_config
+        args.num_layers = 1
+        args.pipeline_model_parallel_size = 1
+
+        self.models, self.optimizers, self.embedding_shape = \
+                get_single_layer_model(gpt_model_provider,
+                                       self.num_gpus_per_node)
+
+        args.pipeline_model_parallel_size = original_pp
+        args.num_layers = original_layers
+        DistributedWrapperContext.CURR_CONFIG = original_config
+        self.curr_mp = mp
+        return self.models, self.optimizers
 
     def _get_optimizer_times(self):
         mp = get_args().tensor_model_parallel_size
@@ -883,22 +978,22 @@ class Estimator:
         model = models.model_with_pre_process[0]
         optimizer = optimizers.optimizer_with_pre_process
         torch.cuda.set_device(0)
-        pre_process_optimizer_time, pre_process_dp_comm_logs = get_optimizer_time(
-                model, optimizer)
+        pre_process_optimizer_time, pre_process_dp_comm_logs = \
+                get_optimizer_time(model, optimizer)
         self._set_dp_comm_logs(pre_process_dp_comm_logs, pre_process=True, post_process=False)
 
         model = models.model_with_post_process[0]
         optimizer = optimizers.optimizer_with_post_process
         torch.cuda.set_device(get_post_process_device(self.num_gpus_per_node))
-        post_process_optimizer_time, post_process_dp_comm_logs = get_optimizer_time(
-                model, optimizer)
+        post_process_optimizer_time, post_process_dp_comm_logs = \
+                get_optimizer_time(model, optimizer)
         self._set_dp_comm_logs(post_process_dp_comm_logs, pre_process=False, post_process=True)
 
         model = models.model_without_pre_or_post_process[0]
         optimizer = optimizers.optimizer_without_pre_or_post_process
         torch.cuda.set_device(get_single_layer_device(self.num_gpus_per_node))
-        single_layer_optimizer_time, single_layer_comm_logs = get_optimizer_time(
-                model, optimizer)
+        single_layer_optimizer_time, single_layer_comm_logs = \
+                get_optimizer_time(model, optimizer)
         self._set_dp_comm_logs(single_layer_comm_logs, pre_process=False, post_process=False)
 
         post_process_optimizer_time -= single_layer_optimizer_time
@@ -908,7 +1003,7 @@ class Estimator:
         mp = args.tensor_model_parallel_size
         optimizer_times = TimeOrMemory(pre_process_optimizer_time,
                                        single_layer_optimizer_time,
-                                       max(0, post_process_optimizer_time))  # post_process 
+                                       max(0, post_process_optimizer_time))  # post_process
         self.optimizer_times[mp] = optimizer_times
 
         param_sizes, grad_sizes = get_param_and_grad_sizes(models, optimizers)
@@ -930,8 +1025,8 @@ class Estimator:
         comm_size = {'mp': mp_comm_size, 'pp': pp_comm_size, 'dp': dp_comm_size}
 
         parallelism_order = [k for k, v in sorted(comm_size.items(), key=lambda item: -item[1])]
-        print("curr parallelism order", parallelism_order)
-        
+        tuner_logger.info(f"curr parallelism order: {parallelism_order}")
+
         config = self.curr_config
         parallel_degree = []
         for parallelism in parallelism_order:
@@ -945,7 +1040,7 @@ class Estimator:
         dp_order = parallelism_order.index('dp')
         mp_order = parallelism_order.index('mp')
         pp_order = parallelism_order.index('pp')
-        
+
         self.curr_task_to_rank.clear()
         for p_rank_1 in range(parallel_degree[0]):
             for p_rank_2 in range(parallel_degree[1]):
@@ -973,7 +1068,7 @@ class Estimator:
                 parallelism_rank = task.dp
             if key not in comm_ranks_per_task:
                 comm_ranks_per_task[key] = [-1] * parallelism_degree
-                
+
             comm_ranks_per_task[key][parallelism_rank] = rank
 
         comm_ranks = {}
@@ -986,7 +1081,6 @@ class Estimator:
 
     def _get_comm_times(self, comm_logs, is_mp=False, is_dp=False):
         """Get communication times for each communication group of a single layer"""
-        args = get_args()
 
         #DistributedWrapperContext.unpatch_dist_func()
         comm_ranks = self._get_comm_ranks(is_mp, is_dp)
@@ -995,7 +1089,7 @@ class Estimator:
         for comm_type, tensor_dtype, tensor_shape in comm_logs:
             # the same time for the collective communication
             single_comm_time_per_rank = self.request_comm(
-                    comm_type, comm_ranks, tensor_dtype, tensor_shape)
+                comm_type, comm_ranks, tensor_dtype, tensor_shape)
             single_comm_time = 0
             for rank in comm_ranks:
                 single_comm_time += single_comm_time_per_rank[rank]
@@ -1027,9 +1121,9 @@ class Estimator:
         post_process_comm_time = self._get_comm_times(comm_logs, is_mp=True)
 
         mp_comm_times = TimeOrMemory(
-                max(0, pre_process_comm_time.mp - single_layer_comm_time.mp),
-                single_layer_comm_time.mp,
-                max(0, post_process_comm_time.mp - single_layer_comm_time.mp))
+            max(0, pre_process_comm_time.mp - single_layer_comm_time.mp),
+            single_layer_comm_time.mp,
+            max(0, post_process_comm_time.mp - single_layer_comm_time.mp))
         return mp_comm_times
 
     def _get_dp_comm_times(self):
@@ -1049,9 +1143,9 @@ class Estimator:
         post_process_comm_time = self._get_comm_times(comm_logs, is_dp=True)
 
         dp_comm_times = TimeOrMemory(
-                max(0, pre_process_comm_time.dp - single_layer_comm_time.dp),
-                single_layer_comm_time.dp,
-                max(0, post_process_comm_time.dp - single_layer_comm_time.dp))
+            max(0, pre_process_comm_time.dp - single_layer_comm_time.dp),
+            single_layer_comm_time.dp,
+            max(0, post_process_comm_time.dp - single_layer_comm_time.dp))
         return dp_comm_times
 
     def _get_comm_size(self):
@@ -1062,7 +1156,7 @@ class Estimator:
         pp = args.pipeline_model_parallel_size
         mb = args.micro_batch_size
         num_micro_batches = args.global_batch_size // dp // mb
-        
+
         mp_size, pp_size, dp_size = 0, 0, 0
         mp_comm_logs = self.mp_comm_logs[(mp, mb)].single_layer
         for comm_type, tensor_dtype, tensor_shape in mp_comm_logs:
@@ -1081,8 +1175,20 @@ class Estimator:
 
         return mp_size, pp_size, dp_size
 
-    def _get_pp_comm_time_per_stage(self):
-        #DistributedWrapperContext.unpatch_dist_func()
+    def _get_stage_ranks(self):
+        """Get stage ranks in order for each (mp, dp) """
+        args = get_args()
+
+        stage_ranks = {} # (mp, dp) -> list of ranks
+        pp = args.pipeline_model_parallel_size
+        for mp in range(args.tensor_model_parallel_size):
+            for dp in range(args.data_parallel_size):
+                stage_ranks[(mp, dp)] = [-1] * pp
+        for task, rank in self.curr_task_to_rank.items():
+            stage_ranks[(task.mp, task.dp)][task.pp] = rank
+        return stage_ranks
+
+    def _get_pp_comm_time_per_stage(self):  # pylint: disable=too-many-branches
         args = get_args()
         pp = args.pipeline_model_parallel_size
 
@@ -1093,29 +1199,12 @@ class Estimator:
             return pp_warmup_comm_time_per_stage, pp_steady_comm_time_per_stage, \
                     pp_embedding_sync_time
 
-        stage_ranks = {} # (mp, dp) -> list of ranks
-        for mp in range(args.tensor_model_parallel_size):
-            for dp in range(args.data_parallel_size):
-                stage_ranks[(mp, dp)] = [-1] * pp
-        for task, rank in self.curr_task_to_rank.items():
-            stage_ranks[(task.mp, task.dp)][task.pp] = rank
+        stage_ranks = self._get_stage_ranks()
 
         assert pp % 2 == 0
-        all_send_recv_ranks = {}
-        send_recv_except_first_and_last_ranks = {}
-        for task, rank in self.curr_task_to_rank.items():
-            key = (task.mp, task.dp)
-            stage = task.pp
-            if task.pp % 2 == 0:
-                all_send_recv_ranks[rank] = [rank, stage_ranks[key][task.pp + 1]]
-                if stage != 0:
-                    send_recv_except_first_and_last_ranks[rank] = \
-                            [stage_ranks[key][task.pp - 1], rank]
-            else:
-                all_send_recv_ranks[rank] = [stage_ranks[key][task.pp - 1], rank]
-                if stage != pp - 1:
-                    send_recv_except_first_and_last_ranks[rank] = \
-                            [rank, stage_ranks[key][task.pp + 1]]
+        all_send_recv_ranks = get_p2p_ranks_for_all(stage_ranks, self.curr_task_to_rank)
+        send_recv_except_first_and_last_ranks = \
+            get_p2p_ranks_except_first_and_last_stage(stage_ranks, self.curr_task_to_rank, pp)
 
         tensor_dtype = torch.float16 if args.fp16 else torch.float32
         tensor_shape = [args.seq_length, args.micro_batch_size, args.hidden_size]
@@ -1126,42 +1215,33 @@ class Estimator:
             if stage == 0:
                 recv_forward = 0
             else:
-                recv_forward_rank_to_comm_ranks = {}
-                for (mp, dp), stage_rank_list in stage_ranks.items():
-                    src_rank = stage_rank_list[stage - 1]
-                    dst_rank = stage_rank_list[stage]
-                    recv_forward_rank_to_comm_ranks[src_rank] = [src_rank, dst_rank]
-                    recv_forward_rank_to_comm_ranks[dst_rank] = [src_rank, dst_rank]
+                p2p_ranks_from_prev_stage = get_p2p_ranks_from_prev_stage(
+                    stage, stage_ranks)
                 recv_forward = self.request_comm(
-                        CommType.SEND_OR_RECV, recv_forward_rank_to_comm_ranks,
-                        tensor_dtype, tensor_shape)[stage_rank]
-            
+                    CommType.SEND_OR_RECV, p2p_ranks_from_prev_stage,
+                    tensor_dtype, tensor_shape)[stage_rank]
+
             # warmup_backward: recv_backward
             if stage == pp - 1:
                 recv_backward = 0
             else:
-                recv_backward_rank_to_comm_ranks = {}
-                for (mp, dp), stage_rank_list in stage_ranks.items():
-                    src_rank = stage_rank_list[stage + 1]
-                    dst_rank = stage_rank_list[stage]
-                    recv_backward_rank_to_comm_ranks[src_rank] = [src_rank, dst_rank]
-                    recv_backward_rank_to_comm_ranks[dst_rank] = [src_rank, dst_rank]
+                p2p_ranks_from_next_stage = get_p2p_ranks_from_next_stage(stage, stage_ranks)
                 recv_backward = self.request_comm(
-                        CommType.SEND_OR_RECV, recv_backward_rank_to_comm_ranks,
-                        tensor_dtype, tensor_shape)[stage_rank]
+                    CommType.SEND_OR_RECV, p2p_ranks_from_next_stage,
+                    tensor_dtype, tensor_shape)[stage_rank]
             pp_warmup_comm_time_per_stage[stage] = recv_forward + recv_backward
 
             # steady: all_send_recv_ranks + send_recv_except_first_and_last_ranks
             all_send_recv_time = self.request_comm(
+                CommType.SEND_AND_RECV,
+                all_send_recv_ranks,
+                tensor_dtype, tensor_shape)[stage_rank]
+
+            if stage not in (0, pp - 1):
+                send_recv_except_first_and_last_time = self.request_comm(
                     CommType.SEND_AND_RECV,
-                    all_send_recv_ranks,
+                    send_recv_except_first_and_last_ranks,
                     tensor_dtype, tensor_shape)[stage_rank]
-            if stage != 0 and stage != pp - 1:
-                send_recv_except_first_and_last_time = \
-                        self.request_comm(
-                                CommType.SEND_AND_RECV,
-                                send_recv_except_first_and_last_ranks,
-                                tensor_dtype, tensor_shape)[stage_rank]
             else:
                 send_recv_except_first_and_last_time = 0
 
@@ -1169,20 +1249,14 @@ class Estimator:
                     all_send_recv_time + send_recv_except_first_and_last_time
 
         if pp > 1:
-            sync_embedding_rank_to_comm_ranks = {}
-            for (mp, dp), stage_rank_list in stage_ranks.items():
-                sync_embedding_rank_to_comm_ranks[stage_rank_list[0]] = \
-                        [stage_rank_list[0], stage_rank_list[-1]]
-                sync_embedding_rank_to_comm_ranks[stage_rank_list[-1]] = \
-                        [stage_rank_list[0], stage_rank_list[-1]]
+            p2p_ranks_for_embedding_sync = get_p2p_ranks_for_embedding_sync(stage_ranks)
             embedding_shape = self.embedding_shape
             pp_embedding_sync_time = self.request_comm(
-                    CommType.ALLREDUCE,
-                    sync_embedding_rank_to_comm_ranks,
-                    torch.float16 if args.fp16 else torch.float32,
-                    embedding_shape)[stage_ranks[(0,0)][0]]
+                CommType.ALLREDUCE,
+                p2p_ranks_for_embedding_sync,
+                torch.float16 if args.fp16 else torch.float32,
+                embedding_shape)[stage_ranks[(0,0)][0]]
 
-        #DistributedWrapperContext.patch_dist_func(self.world_size) 
         return pp_warmup_comm_time_per_stage, pp_steady_comm_time_per_stage, pp_embedding_sync_time
 
     def _set_mp_comm_logs(self, comm_logs, pre_process=False, post_process=False):
@@ -1205,7 +1279,6 @@ class Estimator:
                 tuner_logger.info(f"{comms_to_measure} of {comm_group} is ignored")
                 continue
             self.dp_comm_logs[mp].set(comms_to_measure, pre_process, post_process)
-        print("set_dp_comm_logs", pre_process, post_process)
 
     def _set_forward_backward_time_and_memory(self):
         """Set forward and backward times, activation size, and peak memory. """
@@ -1219,37 +1292,33 @@ class Estimator:
         train_data_iterator = get_train_data_iterator(self.train_ds)
         models, optimizers = self._get_models_and_optimizers()
 
-        # prevent ddp comm
-        context_handler = dummy_handler
-        if isinstance(models.model_with_pre_process, torchDDP):
-            context_handler = models.model_with_pre_process.no_sync
+        assert not isinstance(models.model_with_pre_process, torchDDP)
 
         activation_shape = None
         activation_size = None
 
-        with context_handler():
-            pre_process_forward_backward_time, \
-                    activation_shape, _, pre_process_peak_memory, pre_process_comm_logs = \
-                do_forward_backward(self.num_gpus_per_node,
-                                    self.forward_step_func, models, optimizers,
-                                    train_data_iterator, pre_process=True)
-            self._set_mp_comm_logs(pre_process_comm_logs, pre_process=True)
+        pre_process_forward_backward_time, \
+                activation_shape, _, pre_process_peak_memory, pre_process_comm_logs = \
+            do_forward_backward(self.num_gpus_per_node,
+                                self.forward_step_func, models, optimizers,
+                                train_data_iterator, pre_process=True)
+        self._set_mp_comm_logs(pre_process_comm_logs, pre_process=True)
 
-            single_layer_forward_backward_time, \
-                    activation_shape, activation_size, single_layer_peak_memory, \
-                    single_layer_comm_logs = \
-                do_forward_backward(self.num_gpus_per_node,
-                                    self.forward_step_func, models, optimizers,
-                                    train_data_iterator, input_tensor_shape=activation_shape)
-            self._set_mp_comm_logs(single_layer_comm_logs)
+        single_layer_forward_backward_time, \
+                activation_shape, activation_size, single_layer_peak_memory, \
+                single_layer_comm_logs = \
+            do_forward_backward(self.num_gpus_per_node,
+                                self.forward_step_func, models, optimizers,
+                                train_data_iterator, input_tensor_shape=activation_shape)
+        self._set_mp_comm_logs(single_layer_comm_logs)
 
-            post_process_forward_backward_time, \
-                    _, _, post_process_peak_memory, post_process_comm_logs = \
-                do_forward_backward(self.num_gpus_per_node,
-                                    self.forward_step_func, models, optimizers,
-                                    train_data_iterator, post_process=True,
-                                    input_tensor_shape=activation_shape)
-            self._set_mp_comm_logs(post_process_comm_logs, post_process=True)
+        post_process_forward_backward_time, \
+                _, _, post_process_peak_memory, post_process_comm_logs = \
+            do_forward_backward(self.num_gpus_per_node,
+                                self.forward_step_func, models, optimizers,
+                                train_data_iterator, post_process=True,
+                                input_tensor_shape=activation_shape)
+        self._set_mp_comm_logs(post_process_comm_logs, post_process=True)
 
         pre_process_forward_backward_time -= single_layer_forward_backward_time
         post_process_forward_backward_time -= single_layer_forward_backward_time
@@ -1302,6 +1371,7 @@ class Estimator:
         return self.peak_memories[key]
 
     def get_iter_time(self, config):
+        """Get estimated iteration time for given config"""
 
         # apply config to arguments
         args = get_args()
@@ -1338,8 +1408,7 @@ class Estimator:
         return iter_time, mp_time, pp_time, dp_time
 
     def get_max_gpu_memory(self, config):
-
-        print("get_max_gpu_memory", flush=True)
+        """Get required per gpu memory for given config"""
         # apply config to arguments
         args = get_args()
         args.tensor_model_parallel_size = config.mp
@@ -1352,14 +1421,11 @@ class Estimator:
 
         try:
             param_sizes, grad_sizes = self._get_param_and_grad_sizes()
-            print("get_param_and_grad_sizes", flush=True)
             activation_sizes = self._get_activation_size()
-            print("activation sizes", flush=True)
             peak_memories = self._get_peak_memories()
-            print("peak_memories", flush=True)
 
-            req_gpu_memory = get_required_gpu_memory(param_sizes, grad_sizes, activation_sizes, peak_memories)
-            print("req_gpu_memory", flush=True)
+            req_gpu_memory = get_required_gpu_memory(
+                param_sizes, grad_sizes, activation_sizes, peak_memories)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 tuner_logger.info(f"OOM for {config}")
