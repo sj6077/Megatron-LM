@@ -16,6 +16,7 @@ NUM_AVERAGE = 5
 supported_dtypes = [torch.int16, torch.int32, torch.int64, torch.float16, torch.float32]
 
 class CommType(IntEnum):
+    END = 0
     BROADCAST = 1
     ALLREDUCE = 2
     SEND_OR_RECV = 3
@@ -111,6 +112,7 @@ class CommHelper:
                 backend='gloo',
                 world_size=world_size,
                 rank=rank)
+        torch.distributed.barrier()
         print("initialize communication helper", rank, world_size)
         self.world_size = world_size
         self.my_rank = rank
@@ -126,16 +128,22 @@ class CommHelper:
         else:
             self.tensor_list = None
 
+        if self.my_rank == 0:
+            self.resp_queue.put(0)
+
     @timeout(30)
     def _send_msg_to_all_ranks(self, comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape):
         assert self.my_rank == 0
 
         encoded_comm_type = encode_comm_type(comm_type)
-        encoded_comm_ranks = encode_comm_ranks(self.world_size, rank_to_comm_ranks)
-        encoded_tensor_shape = encode_tensor_dtype_and_shape(
-                tensor_dtype, tensor_shape)
+        if comm_type != CommType.END:
+            encoded_comm_ranks = encode_comm_ranks(self.world_size, rank_to_comm_ranks)
+            encoded_tensor_shape = encode_tensor_dtype_and_shape(
+                    tensor_dtype, tensor_shape)
 
         torch.distributed.broadcast(encoded_comm_type, src=0)
+        if comm_type == CommType.END:
+            return
         torch.distributed.broadcast(encoded_comm_ranks, src=0)
         torch.distributed.broadcast(encoded_tensor_shape, src=0)
 
@@ -148,6 +156,8 @@ class CommHelper:
                 print("received req", comm_type, tensor_dtype, tensor_shape)
                 self._send_msg_to_all_ranks(comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape)
                 print("send_msg_to_all_ranks")
+                if comm_type == CommType.END:
+                    break
 
                 comm_time_per_rank = self._handle_comm(
                         comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape)
@@ -165,6 +175,8 @@ class CommHelper:
             try:
                 torch.distributed.broadcast(self.comm_type_tensor, src=0)
                 comm_type = decode_comm_type(self.comm_type_tensor)
+                if comm_type == CommType.END:
+                    break
                 torch.distributed.broadcast(self.comm_ranks_tensor, src=0)
                 rank_to_comm_ranks = decode_comm_ranks(self.world_size, self.comm_ranks_tensor)
                 torch.distributed.broadcast(self.tensor_shape_tensor, src=0)
