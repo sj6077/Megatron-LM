@@ -870,8 +870,7 @@ class Estimator:  # pylint: disable=too-many-instance-attributes
         ctx = multiprocessing.get_context('spawn')
         node_rank = int(os.environ['NODE_RANK'])
         while True:
-            for proc in self.comm_helper_procs:
-                proc.terminate()
+            self.terminate()
             self.comm_helper_procs.clear()
 
             self.event = ctx.Event()
@@ -900,7 +899,8 @@ class Estimator:  # pylint: disable=too-many-instance-attributes
     def terminate(self):
         """Terminate estimator and communication helper processes"""
         assert self.comm_helper_procs
-        self.req_queue.put((CommType.END, None, None, None))
+        if self.req_queue:
+            self.req_queue.put((CommType.END, None, None, None))
         for proc in self.comm_helper_procs:
             proc.join()
 

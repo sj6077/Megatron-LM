@@ -1,21 +1,23 @@
 """Receive commuinication request from estimator and send back the communication time"""
+# pylint: disable=logging-fstring-interpolation
 from collections import defaultdict
 from functools import wraps
 from enum import IntEnum
 import errno
+import logging
 import os
 import signal
 import time
 from typing import Dict, List
 
 import torch
-from torch._C._distributed_c10d import ReduceOp
 
 NUM_AVERAGE = 5
-
 supported_dtypes = [torch.int16, torch.int32, torch.int64, torch.float16, torch.float32]
+tuner_logger = logging.getLogger('tuner')
 
 class CommType(IntEnum):
+    """Enum for communication type"""
     END = 0
     BROADCAST = 1
     ALLREDUCE = 2
@@ -23,9 +25,11 @@ class CommType(IntEnum):
     SEND_AND_RECV = 4
 
 def encode_comm_type(comm_type: CommType):
+    """Encode communication type as torch.Tensor"""
     return torch.IntTensor([int(comm_type)])
 
 def decode_comm_type(tensor: torch.Tensor):
+    """Decode torch.Tensor to get communication type"""
     comm_type_val = tensor.item()
     return CommType(comm_type_val)
 
@@ -47,6 +51,7 @@ def encode_comm_ranks(world_size:int, rank_to_comm_ranks: Dict[int, List[int]]):
     return torch.IntTensor(val)
 
 def decode_comm_ranks(world_size: int, tensor: torch.Tensor):
+    """Decode torch.Tensor to get communication ranks"""
     rank_to_comm_ranks = {}
     val = tensor.tolist()
     for rank in range(world_size):
@@ -56,6 +61,7 @@ def decode_comm_ranks(world_size: int, tensor: torch.Tensor):
     return rank_to_comm_ranks
 
 def encode_tensor_dtype_and_shape(dtype: torch.Tensor.dtype, tensor_shape: List[int]):
+    """Encode tensor dtype and shape as torch.Tensor"""
     dtype_id = supported_dtypes.index(dtype)
     assert len(tensor_shape) < 9
     val = [0] * 10
@@ -66,16 +72,15 @@ def encode_tensor_dtype_and_shape(dtype: torch.Tensor.dtype, tensor_shape: List[
     return torch.IntTensor(val)
 
 def decode_tensor_dtype_and_shape(tensor: torch.Tensor):
+    """Decode torch.Tensor to get tensor dtype and shape"""
     val = tensor.tolist()
     dtype_id = val[0]
     dtype = supported_dtypes[dtype_id]
     dim = val[1]
     return dtype, [val[i+2] for i in range(dim)]
 
-class TimeoutError(Exception):
-    pass
-
 def timeout(seconds=10, error_message=os.strerror(errno.ETIME)):
+    """Decorator to raise timeout error"""
     def decorator(func):
         def _handle_timeout(signum, frame):
             raise TimeoutError(error_message)
@@ -91,7 +96,7 @@ def timeout(seconds=10, error_message=os.strerror(errno.ETIME)):
         return wraps(func)(wrapper)
     return decorator
 
-class CommHelper:
+class CommHelper:  # pylint: disable=too-many-instance-attributes
     """A helper class that can estimate nccl communication time."""
 
     def __init__(self, event, req_queue=None, resp_queue=None):
@@ -113,7 +118,7 @@ class CommHelper:
                 world_size=world_size,
                 rank=rank)
         torch.distributed.barrier()
-        print("initialize communication helper", rank, world_size)
+        tuner_logger.info(f"initialize communication helper for rank{rank}")
         self.world_size = world_size
         self.my_rank = rank
 
@@ -148,14 +153,20 @@ class CommHelper:
         torch.distributed.broadcast(encoded_tensor_shape, src=0)
 
     def run_msg_handler_for_rank0(self):
-        print("run_msg_handler_for_rank0")
+        """Run message handler for master(rank0)
+           It receives communication requests using multiprocessing queue
+           and broadcasts the request to all other ranks.
+        """
+        tuner_logger.debug("run_msg_handler_for_rank0")
         while not self.event.is_set():
-            print("wait request queue's input")
-            comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape = self.req_queue.get()
+            tuner_logger.debug("wait request queue's input")
+            comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape = \
+                    self.req_queue.get()
             try:
-                print("received req", comm_type, tensor_dtype, tensor_shape)
-                self._send_msg_to_all_ranks(comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape)
-                print("send_msg_to_all_ranks")
+                tuner_logger.debug(f"received req: {comm_type}, {tensor_dtype}, {tensor_shape}")
+                self._send_msg_to_all_ranks(
+                    comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape)
+                tuner_logger.debug("send_msg_to_all_ranks")
                 if comm_type == CommType.END:
                     break
 
@@ -164,13 +175,14 @@ class CommHelper:
                 if comm_time_per_rank is None:
                     self.event.set()
                     break
-                print("response queue put", comm_time_per_rank)
+                tuner_logger.debug(f"response queue put: {comm_time_per_rank}")
                 self.resp_queue.put(comm_time_per_rank)
-            except Exception as e:
+            except Exception as error:
                 self.event.set()
-                raise e
+                raise error
 
     def run_msg_handler(self):
+        """Run message handler for non-rank0 GPUs."""
         while not self.event.is_set():
             try:
                 torch.distributed.broadcast(self.comm_type_tensor, src=0)
@@ -181,11 +193,11 @@ class CommHelper:
                 rank_to_comm_ranks = decode_comm_ranks(self.world_size, self.comm_ranks_tensor)
                 torch.distributed.broadcast(self.tensor_shape_tensor, src=0)
                 tensor_dtype, tensor_shape = decode_tensor_dtype_and_shape(self.tensor_shape_tensor)
-                print("receive msg for", comm_type, tensor_dtype, tensor_shape)
+                tuner_logger.debug(f"receive msg for {comm_type}, {tensor_dtype}, {tensor_shape}")
                 self._handle_comm(comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape)
-            except Exception as e:
+            except Exception as error:
                 self.event.set()
-                raise e
+                raise error
 
     def _get_comm_group(self, comm_ranks):
         key = tuple(comm_ranks)
@@ -193,6 +205,48 @@ class CommHelper:
             new_group = torch.distributed.new_group(ranks=comm_ranks, backend='nccl')
             self.comm_group[key] = new_group
         return self.comm_group[key]
+
+    def _get_comm_time(self, comm_type, comm_tensor, comm_ranks, group):
+        """Get communication time by actual execution"""
+        if comm_type == CommType.SEND_AND_RECV:
+            comm_tensor2 = comm_tensor.clone()
+
+        comm_times = []
+        for _ in range(NUM_AVERAGE + 1):
+            if comm_type == CommType.BROADCAST:
+                torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
+            elif comm_type == CommType.ALLREDUCE:
+                torch.distributed.all_reduce(comm_tensor, group=group)
+            elif comm_type == CommType.SEND_OR_RECV:
+                if self.my_rank == comm_ranks[0]:
+                    torch.distributed.send(comm_tensor, dst=comm_ranks[1], group=group)
+                else:
+                    torch.distributed.recv(comm_tensor, src=comm_ranks[0], group=group)
+            elif comm_type == CommType.SEND_AND_RECV:
+                if self.my_rank == comm_ranks[0]:
+                    other_rank = comm_ranks[1]
+                else:
+                    other_rank = comm_ranks[0]
+                send_op = torch.distributed.P2POp(torch.distributed.isend,
+                                                  comm_tensor,
+                                                  other_rank,
+                                                  group=group)
+                recv_op = torch.distributed.P2POp(torch.distributed.irecv,
+                                                  comm_tensor2,
+                                                  other_rank,
+                                                  group=group)
+                reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
+                for req in reqs:
+                    req.wait()
+            else:
+                raise NotImplementedError
+
+            start = time.time()
+            torch.cuda.synchronize()
+            comm_times.append(time.time() - start)
+        del comm_times[0]
+        comm_time = sum(comm_times) / len(comm_times)
+        return comm_time
 
     @timeout(60)
     def _handle_comm(self, comm_type, rank_to_comm_ranks, tensor_dtype, tensor_shape):
@@ -213,47 +267,11 @@ class CommHelper:
                 comm_tensor = torch.randint(low=0, high=100, size=tuple(tensor_shape)).cuda()
             else:
                 comm_tensor = torch.randn(tensor_shape, dtype=tensor_dtype).cuda()
-            if comm_type == CommType.SEND_AND_RECV:
-                comm_tensor2 = comm_tensor.clone()
 
             comm_ranks = rank_to_comm_ranks[self.my_rank]
             group = groups[self.my_rank]
             if len(comm_ranks) > 1:
-                comm_times = []
-                for i in range(NUM_AVERAGE + 1):
-                    if comm_type == CommType.BROADCAST:
-                        torch.distributed.broadcast(comm_tensor, src=comm_ranks[0], group=group)
-                    elif comm_type == CommType.ALLREDUCE:
-                        torch.distributed.all_reduce(comm_tensor, group=group)
-                    elif comm_type == CommType.SEND_OR_RECV:
-                        if self.my_rank == comm_ranks[0]:
-                            torch.distributed.send(comm_tensor, dst=comm_ranks[1], group=group)
-                        else:
-                            torch.distributed.recv(comm_tensor, src=comm_ranks[0], group=group)
-                    elif comm_type == CommType.SEND_AND_RECV:
-                        if self.my_rank == comm_ranks[0]:
-                            other_rank = comm_ranks[1]
-                        else:
-                            other_rank = comm_ranks[0]
-                        send_op = torch.distributed.P2POp(torch.distributed.isend,
-                                                          comm_tensor,
-                                                          other_rank,
-                                                          group=group)
-                        recv_op = torch.distributed.P2POp(torch.distributed.irecv,
-                                                          comm_tensor2,
-                                                          other_rank,
-                                                          group=group)
-                        reqs = torch.distributed.batch_isend_irecv([send_op, recv_op])
-                        for req in reqs:
-                            req.wait()
-                    else:
-                        raise NotImplementedError
-
-                    s = time.time()
-                    torch.cuda.synchronize()
-                    if i > 0:
-                        comm_times.append(time.time() - s)
-                comm_time = sum(comm_times) / len(comm_times)
+                comm_time = self._get_comm_time(comm_type, comm_tensor, comm_ranks, group)
                 self.comm_time_tensor.data[0] = comm_time
 
         torch.distributed.gather(self.comm_time_tensor, self.tensor_list, dst=0)
