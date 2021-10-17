@@ -60,7 +60,7 @@ class Tuner:  # pylint: disable=too-few-public-methods
                             tensor_model_parallel_size // \
                             pipeline_model_parallel_size
                     if not decrease_pipeline_model_parallel_size or \
-                            self.global_batch_size % (data_parallel_size, micro_batch_size) != 0:
+                            self.global_batch_size % (data_parallel_size * micro_batch_size) != 0:
                         continue
 
                     config = Config(micro_batch_size=micro_batch_size,

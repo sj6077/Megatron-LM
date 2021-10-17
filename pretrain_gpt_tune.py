@@ -1,7 +1,12 @@
 """Execute tuner for gpt pretraining"""
+import logging
 import os
 
-from tuner.tuner import Tuner
+logging.basicConfig()
+tuner_logger = logging.getLogger('tuner')
+tuner_logger.setLevel(logging.INFO)
+
+from tuner.tuner import Tuner  # pylint: disable=wrong-import-position
 
 if __name__ == "__main__":
     world_size = int(os.environ['WORLD_SIZE'])
